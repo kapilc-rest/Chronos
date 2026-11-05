@@ -1,8 +1,8 @@
 {
   "id": "./index.html",
-  "name": "Chronos Journal",
+  "name": "Chronos Journal & Public Blog",
   "short_name": "Chronos",
-  "description": "An aesthetic personal calendar journal, daily reminder, and public blog application.",
+  "description": "An aesthetic calendar journal with daily time-based reminders, rich markdown editor, full-text search, and instant public blog publishing.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
@@ -10,6 +10,12 @@
   "background_color": "#0f172a",
   "theme_color": "#0f172a",
   "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
     {
       "src": "./pwa-192x192.png",
       "sizes": "192x192",
@@ -20,18 +26,13 @@
       "src": "./pwa-512x512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     },
     {
-      "src": "./pwa-512x512.png",
-      "sizes": "512x512",
+      "src": "./apple-touch-icon.png",
+      "sizes": "180x180",
       "type": "image/png",
-      "purpose": "maskable"
-    },
-    {
-      "src": "./icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml"
+      "purpose": "any"
     }
   ]
 }

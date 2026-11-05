@@ -2,5 +2,7 @@
   "name": "Chronos Journal & Public Blog",
   "description": "An aesthetic calendar journal with daily time-based reminders, rich markdown editor, full-text search, and instant public blog publishing.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
