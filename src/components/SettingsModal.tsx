@@ -13,15 +13,19 @@ import {
   Play, 
   AlertCircle,
   ExternalLink,
-  Smartphone
+  Smartphone,
+  Globe
 } from 'lucide-react';
 import { usePWAInstall } from '../usePWAInstall';
 import { ReminderSettings, StorageConfig, JournalEntry } from '../types';
 import { 
-  requestNotificationPermission, 
+  getReminderPermissionInfo,
+  requestPlatformPermission,
+  requestExactAlarmSettings,
   isNotificationSupported, 
   playHarmonicChime,
-  triggerBrowserNotification 
+  triggerBrowserNotification,
+  isNativePlatform,
 } from '../services/notifications';
 import { SUPABASE_SQL_SCHEMA, syncWithSupabase } from '../services/storage';
 
@@ -51,31 +55,62 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [activeTab, setActiveTab] = useState<'reminders' | 'cloud' | 'profile' | 'backup'>('reminders');
   const [reminders, setReminders] = useState<ReminderSettings>(reminderSettings);
   const [cfg, setCfg] = useState<StorageConfig>(config);
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default');
+  const [notificationPermission, setNotificationPermission] = useState<string>('default');
   const [copiedSchema, setCopiedSchema] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
+
+  const [reminderEngineInfo, setReminderEngineInfo] = useState<{
+    isNative: boolean;
+    notificationPermission: string;
+    exactAlarmPermission?: string;
+    isExactAlarmSupported?: boolean;
+  }>({
+    isNative: isNativePlatform(),
+    notificationPermission: 'default',
+  });
+
+  const refreshPermissions = async () => {
+    try {
+      const info = await getReminderPermissionInfo();
+      setReminderEngineInfo(info);
+      setNotificationPermission(info.notificationPermission);
+    } catch (err) {
+      console.warn('Could not refresh permissions:', err);
+    }
+  };
 
   useEffect(() => {
     if (isOpen) {
       setReminders(reminderSettings);
       setCfg(config);
-      if (typeof window !== 'undefined' && 'Notification' in window) {
-        setNotificationPermission(Notification.permission);
-      }
+      refreshPermissions();
     }
   }, [isOpen, reminderSettings, config]);
 
   if (!isOpen) return null;
 
-  // Request browser permission
+  // Request platform permission (Native Android or Web)
   const handleRequestPermission = async () => {
-    const perm = await requestNotificationPermission();
-    setNotificationPermission(perm);
-    if (perm === 'granted') {
-      onShowToast('Notifications Enabled!', 'You will receive daily reminders at your chosen time.', 'success');
-    } else {
-      onShowToast('Permission Not Granted', 'Please check your browser settings to allow notifications.', 'error');
+    try {
+      const res = await requestPlatformPermission();
+      await refreshPermissions();
+      if (res.granted) {
+        onShowToast('Notifications Enabled!', 'You will receive daily reminders at your chosen time.', 'success');
+      } else {
+        onShowToast('Permission Not Granted', 'Please enable notifications in device or browser settings.', 'error');
+      }
+    } catch {
+      onShowToast('Permission Error', 'Could not request notification permission.', 'error');
+    }
+  };
+
+  const handleRequestExactAlarms = async () => {
+    try {
+      await requestExactAlarmSettings();
+      await refreshPermissions();
+    } catch {
+      // Silently continue
     }
   };
 
@@ -238,13 +273,72 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* TAB 1: Reminders */}
           {activeTab === 'reminders' && (
             <div className="space-y-5">
+              {/* Reminder Engine Platform Mode Indicator */}
+              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 flex items-start gap-3">
+                <div className={`p-2.5 rounded-lg ${reminderEngineInfo.isNative ? 'bg-emerald-500/15 text-emerald-500' : 'bg-cyan-500/15 text-cyan-500'} shrink-0 mt-0.5`}>
+                  {reminderEngineInfo.isNative ? <Smartphone className="w-5 h-5" /> : <Globe className="w-5 h-5" />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                      Engine Mode:
+                    </span>
+                    <span className={`text-xs font-semibold px-2.5 py-0.5 rounded-full inline-flex items-center gap-1.5 ${
+                      reminderEngineInfo.isNative
+                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
+                        : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${reminderEngineInfo.isNative ? 'bg-emerald-500' : 'bg-cyan-500'}`} />
+                      <span>{reminderEngineInfo.isNative ? 'Native Android' : 'Web (only works while app is open)'}</span>
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 leading-relaxed">
+                    {reminderEngineInfo.isNative
+                      ? 'Android background reminders enabled. Chronos schedules 7 days of notifications ahead with high importance so you receive alerts even when the app is completely closed.'
+                      : 'Browser active-tab mode. Reminders will trigger via active-tab alerts and audio chime when Chronos is open in your browser or PWA window.'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Android 13+ Notification Permission Alert Banner (if denied) */}
+              {reminderEngineInfo.isNative && notificationPermission === 'denied' && (
+                <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-700 dark:text-rose-400 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                    <span>Android 13+ notification permission is blocked. Scheduled daily reminders will not appear until notifications are enabled in Android Settings.</span>
+                  </div>
+                  <button
+                    onClick={handleRequestPermission}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shrink-0 transition-colors"
+                  >
+                    Allow Notifications
+                  </button>
+                </div>
+              )}
+
+              {/* Android 12+ Exact Alarms Permission Alert Banner (if denied) */}
+              {reminderEngineInfo.isNative && reminderEngineInfo.isExactAlarmSupported && reminderEngineInfo.exactAlarmPermission === 'denied' && (
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                    <span>Exact alarm scheduling is restricted by Android battery optimization. Reminders may be delayed slightly.</span>
+                  </div>
+                  <button
+                    onClick={handleRequestExactAlarms}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white shrink-0 transition-colors"
+                  >
+                    Open Alarm Settings
+                  </button>
+                </div>
+              )}
+
               <div className="flex items-center justify-between p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
                     Enable Daily Writing Notification
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Receive active-tab reminders and desktop notifications to maintain your journal habit.
+                    Receive daily reminders at your chosen time to maintain your journaling streak.
                   </p>
                 </div>
                 <label className="relative inline-flex items-center cursor-pointer">
@@ -291,12 +385,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Browser Permission Status */}
+              {/* Permission Status Box */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                      Browser Notification Permission:
+                      Notification Permission:
                     </span>
                     <span className={`text-xs px-2 py-0.5 rounded font-mono ${
                       notificationPermission === 'granted'

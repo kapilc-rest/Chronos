@@ -20,7 +20,7 @@ import {
   deleteEntryFromCloud,
 } from './services/storage';
 import { formatDateToIso } from './services/markdown';
-import { checkAndTriggerReminder } from './services/notifications';
+import { checkAndTriggerReminder, syncReminders, cancelTodayPendingNotification } from './services/notifications';
 import { getCurrentUser, logoutUser } from './services/auth';
 
 export default function App() {
@@ -155,30 +155,37 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [authUser]);
 
-  // Time-based Daily Reminder polling loop
+  // Time-based Daily Reminder polling loop & Native schedule syncing
   useEffect(() => {
     if (!authUser) return;
 
     const todayIso = formatDateToIso(new Date());
     const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
 
+    // Sync native 7-day schedule (or cancel today if already written)
+    syncReminders(reminderSettings, hasTodayEntry);
+
     const checkReminder = () => {
-      const triggered = checkAndTriggerReminder(
-        reminderSettings,
-        hasTodayEntry,
-        (title, message) => {
-          showToast(title, message, 'info');
-          const updatedSettings = {
-            ...reminderSettings,
-            lastNotifiedDate: todayIso,
-          };
-          setReminderSettings(updatedSettings);
-          saveReminderSettings(updatedSettings);
-        }
-      );
+      try {
+        checkAndTriggerReminder(
+          reminderSettings,
+          hasTodayEntry,
+          (title, message) => {
+            showToast(title, message, 'info');
+            const updatedSettings = {
+              ...reminderSettings,
+              lastNotifiedDate: todayIso,
+            };
+            setReminderSettings(updatedSettings);
+            saveReminderSettings(updatedSettings);
+          }
+        );
+      } catch (err) {
+        console.warn('Error in checkReminder:', err);
+      }
     };
 
-    // Check immediately and every 25 seconds
+    // Check immediately and on a regular 25s interval (single timer cleaned up on unmount)
     checkReminder();
     const interval = setInterval(checkReminder, 25000);
     return () => clearInterval(interval);
@@ -252,6 +259,12 @@ export default function App() {
       return updated;
     });
 
+    // When today's entry is saved with content, cancel today's pending notification & re-fill 7-day schedule
+    if (entry.content && entry.content.trim().length > 0) {
+      cancelTodayPendingNotification();
+      syncReminders(reminderSettings, true);
+    }
+
     // Cloud sync if enabled
     if (config.provider === 'supabase') {
       persistEntryToCloud(config, entry).catch(err => {
@@ -288,6 +301,9 @@ export default function App() {
   const handleSaveReminders = (newSettings: ReminderSettings) => {
     setReminderSettings(newSettings);
     saveReminderSettings(newSettings);
+    const todayIso = formatDateToIso(new Date());
+    const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
+    syncReminders(newSettings, hasTodayEntry);
   };
 
   const handleSaveConfig = (newConfig: StorageConfig) => {

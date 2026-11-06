@@ -1,19 +1,28 @@
+import { Capacitor } from '@capacitor/core';
 import { ReminderSettings } from '../types';
+import { formatDateToIso } from './markdown';
+
+export const CHANNEL_ID = 'chronos-daily';
 
 let audioCtx: AudioContext | null = null;
+let listenerInitialized = false;
 
 function getAudioContext(): AudioContext | null {
   if (typeof window === 'undefined') return null;
-  if (!audioCtx) {
-    const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (AudioContextClass) {
-      audioCtx = new AudioContextClass();
+  try {
+    if (!audioCtx) {
+      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (AudioContextClass) {
+        audioCtx = new AudioContextClass();
+      }
     }
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    return audioCtx;
+  } catch {
+    return null;
   }
-  if (audioCtx && audioCtx.state === 'suspended') {
-    audioCtx.resume();
-  }
-  return audioCtx;
 }
 
 /**
@@ -60,30 +69,369 @@ export function playHarmonicChime() {
   }
 }
 
+/**
+ * Returns true strictly if running as a native Capacitor app (Android / iOS).
+ * Safe to call in any standard browser without throwing.
+ */
+export function isNativePlatform(): boolean {
+  try {
+    if (typeof window === 'undefined') return false;
+    const winCap = (window as any).Capacitor;
+    if (winCap && typeof winCap.isNativePlatform === 'function') {
+      return winCap.isNativePlatform();
+    }
+    if (Capacitor && typeof Capacitor.isNativePlatform === 'function') {
+      return Capacitor.isNativePlatform();
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lazy-loads the Capacitor LocalNotifications plugin ONLY on native platforms.
+ * Never called at module load or in standard browser mode.
+ */
+async function getNativeLocalNotifications() {
+  if (!isNativePlatform()) return null;
+  try {
+    const mod = await import('@capacitor/local-notifications');
+    return mod.LocalNotifications;
+  } catch (err) {
+    console.warn('Native LocalNotifications plugin could not be loaded:', err);
+    return null;
+  }
+}
+
+/**
+ * Computes a deterministic 32-bit positive integer ID from YYYY-MM-DD
+ * Example: '2026-11-06' -> 261106
+ */
+export function getNotificationIdForDate(dateStr: string): number {
+  try {
+    const parts = dateStr.split('-').map(Number);
+    const y = (parts[0] || 2026) % 100;
+    const m = parts[1] || 1;
+    const d = parts[2] || 1;
+    return y * 10000 + m * 100 + d;
+  } catch {
+    return Math.floor(Math.random() * 100000);
+  }
+}
+
+/**
+ * Initializes the Capacitor notification action listener so tapping a notification navigates to today's entry
+ */
+export async function initNotificationActionListener(): Promise<void> {
+  if (!isNativePlatform() || listenerInitialized) return;
+  listenerInitialized = true;
+
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) return;
+
+    await LocalNotifications.addListener('localNotificationActionPerformed', () => {
+      window.location.hash = '#/today';
+    });
+  } catch (err) {
+    console.warn('Could not register localNotificationActionPerformed listener:', err);
+  }
+}
+
+/**
+ * Ensures the Android high-importance notification channel exists
+ */
+export async function ensureNativeChannel(): Promise<void> {
+  if (!isNativePlatform()) return;
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) return;
+
+    await LocalNotifications.createChannel({
+      id: CHANNEL_ID,
+      name: 'Daily Writing Reminders',
+      description: 'Reminds you to write your daily reflection in Chronos Journal',
+      importance: 5, // High importance (heads-up notification)
+      visibility: 1, // Public on lock screen
+      lights: true,
+      lightColor: '#10b981',
+      vibration: true,
+    });
+  } catch (err) {
+    console.warn('Failed to create notification channel:', err);
+  }
+}
+
+/**
+ * Cancels today's pending local notification when an entry is saved with content
+ */
+export async function cancelTodayPendingNotification(): Promise<void> {
+  if (!isNativePlatform()) return;
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) return;
+
+    const todayIso = formatDateToIso(new Date());
+    const id = getNotificationIdForDate(todayIso);
+    await LocalNotifications.cancel({
+      notifications: [{ id }],
+    });
+  } catch (err) {
+    console.warn('Could not cancel today notification:', err);
+  }
+}
+
+/**
+ * Schedules the next 7 days of daily reminder notifications on Android/iOS via Capacitor
+ */
+export async function scheduleNative7DayReminders(
+  settings: ReminderSettings,
+  hasTodayEntry: boolean
+): Promise<{ success: boolean; scheduledCount: number; error?: string }> {
+  if (!isNativePlatform()) {
+    return { success: false, scheduledCount: 0, error: 'Not on native platform' };
+  }
+
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) {
+      return { success: false, scheduledCount: 0, error: 'Plugin unavailable' };
+    }
+
+    await ensureNativeChannel();
+
+    // Check / Request permissions
+    const permStatus = await LocalNotifications.checkPermissions();
+    if (permStatus.display !== 'granted') {
+      const requested = await LocalNotifications.requestPermissions();
+      if (requested.display !== 'granted') {
+        return { success: false, scheduledCount: 0, error: 'Notification permission not granted' };
+      }
+    }
+
+    // Cancel existing pending notifications in our range to avoid duplicates
+    const pending = await LocalNotifications.getPending();
+    if (pending && pending.notifications && pending.notifications.length > 0) {
+      await LocalNotifications.cancel({ notifications: pending.notifications });
+    }
+
+    if (!settings.enabled) {
+      return { success: true, scheduledCount: 0 };
+    }
+
+    const [targetHours, targetMinutes] = (settings.time || '21:00').split(':').map(Number);
+    const notificationsToSchedule = [];
+
+    const now = new Date();
+
+    for (let i = 0; i < 7; i++) {
+      const targetDate = new Date();
+      targetDate.setDate(now.getDate() + i);
+      targetDate.setHours(targetHours, targetMinutes, 0, 0);
+
+      const dateStr = formatDateToIso(targetDate);
+      const id = getNotificationIdForDate(dateStr);
+
+      // If today and already passed or today's entry already exists with content, skip today
+      if (i === 0) {
+        if (hasTodayEntry) {
+          continue;
+        }
+        if (targetDate.getTime() <= now.getTime()) {
+          continue;
+        }
+      }
+
+      notificationsToSchedule.push({
+        id,
+        title: settings.title || 'Time to write today’s journal',
+        body: settings.message || 'Take 3 quiet minutes to capture your reflections, gratitude, and wins from today.',
+        channelId: CHANNEL_ID,
+        schedule: {
+          at: targetDate,
+          allowWhileIdle: true,
+        },
+        extra: {
+          date: dateStr,
+          url: '#/today',
+        },
+      });
+    }
+
+    if (notificationsToSchedule.length > 0) {
+      await LocalNotifications.schedule({
+        notifications: notificationsToSchedule,
+      });
+    }
+
+    return { success: true, scheduledCount: notificationsToSchedule.length };
+  } catch (err: any) {
+    console.error('Failed to schedule native reminders:', err);
+    return { success: false, scheduledCount: 0, error: err?.message || 'Failed to schedule native reminders' };
+  }
+}
+
+/**
+ * High-level helper called when app opens, settings change, or entry is saved
+ */
+export async function syncReminders(
+  settings: ReminderSettings,
+  hasTodayEntry: boolean
+): Promise<void> {
+  if (!isNativePlatform()) return;
+  try {
+    await initNotificationActionListener();
+    if (hasTodayEntry) {
+      await cancelTodayPendingNotification();
+    }
+    await scheduleNative7DayReminders(settings, hasTodayEntry);
+  } catch (err) {
+    console.warn('Native reminder sync caught error:', err);
+  }
+}
+
+/**
+ * Checks platform permission details for Settings UI
+ */
+export async function getReminderPermissionInfo(): Promise<{
+  isNative: boolean;
+  notificationPermission: string;
+  exactAlarmPermission?: string;
+  isExactAlarmSupported?: boolean;
+}> {
+  if (isNativePlatform()) {
+    try {
+      const LocalNotifications = await getNativeLocalNotifications();
+      if (!LocalNotifications) {
+        return { isNative: true, notificationPermission: 'prompt' };
+      }
+
+      const perms: any = await LocalNotifications.checkPermissions();
+      let exactStatus: string = 'granted';
+      let isExactAlarmSupported = false;
+
+      if (typeof (LocalNotifications as any).checkExactNotificationSetting === 'function') {
+        isExactAlarmSupported = true;
+        try {
+          const exactRes = await (LocalNotifications as any).checkExactNotificationSetting();
+          exactStatus = exactRes?.exact_alarm || 'granted';
+        } catch {
+          exactStatus = 'granted';
+        }
+      }
+
+      return {
+        isNative: true,
+        notificationPermission: perms?.display || 'prompt',
+        exactAlarmPermission: exactStatus,
+        isExactAlarmSupported,
+      };
+    } catch {
+      return {
+        isNative: true,
+        notificationPermission: 'prompt',
+        exactAlarmPermission: 'granted',
+      };
+    }
+  }
+
+  // Web fallback (pure browser)
+  const webPerm = typeof window !== 'undefined' && 'Notification' in window
+    ? Notification.permission
+    : 'denied';
+
+  return {
+    isNative: false,
+    notificationPermission: webPerm,
+  };
+}
+
+/**
+ * Requests notification permissions for either Native or Web
+ */
+export async function requestPlatformPermission(): Promise<{
+  granted: boolean;
+  permission: string;
+}> {
+  if (isNativePlatform()) {
+    try {
+      const LocalNotifications = await getNativeLocalNotifications();
+      if (LocalNotifications) {
+        const res = await LocalNotifications.requestPermissions();
+        return {
+          granted: res.display === 'granted',
+          permission: res.display,
+        };
+      }
+    } catch {
+      return { granted: false, permission: 'denied' };
+    }
+  }
+
+  // Web platform
+  if (typeof window !== 'undefined' && 'Notification' in window) {
+    try {
+      const perm = await Notification.requestPermission();
+      return {
+        granted: perm === 'granted',
+        permission: perm,
+      };
+    } catch {
+      return { granted: false, permission: 'denied' };
+    }
+  }
+
+  return { granted: false, permission: 'denied' };
+}
+
+/**
+ * Redirects user to exact alarm settings if needed (Android 12+)
+ */
+export async function requestExactAlarmSettings(): Promise<void> {
+  if (!isNativePlatform()) return;
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (LocalNotifications && typeof (LocalNotifications as any).changeExactNotificationSetting === 'function') {
+      await (LocalNotifications as any).changeExactNotificationSetting();
+    }
+  } catch (err) {
+    console.warn('Could not open exact alarm setting:', err);
+  }
+}
+
 export function isNotificationSupported(): boolean {
+  if (isNativePlatform()) return true;
   return typeof window !== 'undefined' && 'Notification' in window;
 }
 
-export async function requestNotificationPermission(): Promise<NotificationPermission> {
-  if (!isNotificationSupported()) {
-    return 'denied';
-  }
-  try {
-    return await Notification.requestPermission();
-  } catch (err) {
-    console.error('Error requesting notification permission:', err);
-    return 'denied';
-  }
-}
-
 export function triggerBrowserNotification(title: string, body: string, onClick?: () => void) {
+  if (isNativePlatform()) {
+    getNativeLocalNotifications().then((LocalNotifications) => {
+      if (LocalNotifications) {
+        LocalNotifications.schedule({
+          notifications: [
+            {
+              id: Math.floor(Math.random() * 1000000),
+              title,
+              body,
+              channelId: CHANNEL_ID,
+              schedule: { at: new Date(Date.now() + 500) },
+            },
+          ],
+        }).catch((err) => console.warn('Native notification trigger failed:', err));
+      }
+    }).catch(() => {});
+    return;
+  }
+
   if (!isNotificationSupported()) return;
 
   if (Notification.permission === 'granted') {
     try {
       const notification = new Notification(title, {
         body,
-        icon: 'https://api.iconify.design/lucide:book-open.svg?color=%2310b981',
+        icon: './icon.svg',
         tag: 'chronos-daily-reminder',
       });
 
@@ -100,35 +448,47 @@ export function triggerBrowserNotification(title: string, body: string, onClick?
   }
 }
 
+/**
+ * Web polling reminder:
+ * - Uses local date (formatDateToIso).
+ * - Fires at most once per day via lastNotifiedDate check in localStorage & settings.
+ * - Skips if today's entry already has content.
+ * - Uses currentTime >= settings.time so if opened after the reminder time, shows a single notification.
+ */
 export function checkAndTriggerReminder(
   settings: ReminderSettings,
   hasEntryForToday: boolean,
   onNotify: (title: string, message: string) => void
 ): boolean {
   if (!settings.enabled) return false;
+  if (hasEntryForToday) return false;
 
   const now = new Date();
+  const todayIso = formatDateToIso(now);
+
+  // Check in-memory setting and persistent localStorage
+  const storedLastNotified = typeof window !== 'undefined' ? localStorage.getItem('chronos_last_notified_date') : null;
+  if (settings.lastNotifiedDate === todayIso || storedLastNotified === todayIso) {
+    return false;
+  }
+
   const currentHours = String(now.getHours()).padStart(2, '0');
   const currentMinutes = String(now.getMinutes()).padStart(2, '0');
   const currentTime = `${currentHours}:${currentMinutes}`;
 
-  const todayIso = now.toISOString().split('T')[0];
+  // If current local time has reached or passed settings.time today
+  if (currentTime >= (settings.time || '21:00')) {
+    // Record in localStorage immediately so it never fires more than once today
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('chronos_last_notified_date', todayIso);
+    }
 
-  // If already notified today, skip
-  if (settings.lastNotifiedDate === todayIso) {
-    return false;
-  }
-
-  // If currentTime matches or has passed the set time today
-  if (currentTime === settings.time) {
     if (settings.sound) {
       playHarmonicChime();
     }
 
     const title = settings.title || 'Time to write today’s journal';
-    const message = hasEntryForToday
-      ? 'A quick evening reflection? Take a minute to add notes to today’s entry.'
-      : (settings.message || 'Take 3 quiet minutes to capture your reflections, gratitude, and wins from today.');
+    const message = settings.message || 'Take 3 quiet minutes to capture your reflections, gratitude, and wins from today.';
 
     triggerBrowserNotification(title, message, () => {
       window.location.hash = '#/today';
