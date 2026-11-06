@@ -308,19 +308,22 @@ export default function App() {
   };
 
   // Save Settings Handlers
-  const handleSaveReminders = async (newSettings: ReminderSettings) => {
+  const handleSaveReminders = (newSettings: ReminderSettings) => {
     setReminderSettings(newSettings);
     saveReminderSettings(newSettings);
     const todayIso = formatDateToIso(new Date());
     const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
-    try {
-      const res = await syncReminders(newSettings, hasTodayEntry);
-      if (!res.success && res.error) {
-        showToast('Reminder Notice', res.error, 'error');
-      }
-    } catch (err: any) {
-      showToast('Reminder Sync Error', err?.message || 'Could not schedule native reminders', 'error');
-    }
+    setTimeout(() => {
+      syncReminders(newSettings, hasTodayEntry)
+        .then(res => {
+          if (!res.success && res.error) {
+            showToast('Reminder Notice', res.error, 'error');
+          }
+        })
+        .catch(err => {
+          showToast('Reminder Sync Error', err?.message || 'Could not schedule native reminders', 'error');
+        });
+    }, 50);
   };
 
   const handleSaveConfig = (newConfig: StorageConfig) => {

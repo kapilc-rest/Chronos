@@ -1,4 +1,5 @@
 import { Capacitor } from '@capacitor/core';
+import { LocalNotifications } from '@capacitor/local-notifications';
 import { ReminderSettings } from '../types';
 import { formatDateToIso } from './markdown';
 
@@ -90,18 +91,41 @@ export function isNativePlatform(): boolean {
 }
 
 /**
- * Lazy-loads the Capacitor LocalNotifications plugin ONLY on native platforms.
- * Never called at module load or in standard browser mode.
+ * Wraps any promise with a 5-second timeout using Promise.race.
+ * On timeout or error, rejects with the exact error message.
  */
-async function getNativeLocalNotifications() {
-  if (!isNativePlatform()) return null;
+export async function withPluginTimeout<T>(
+  promise: Promise<T>,
+  actionName: string,
+  timeoutMs = 5000
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${actionName} timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+  });
+
   try {
-    const mod = await import('@capacitor/local-notifications');
-    return mod.LocalNotifications;
-  } catch (err) {
-    console.warn('Native LocalNotifications plugin could not be loaded:', err);
-    return null;
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Resolves the native LocalNotifications plugin instance safely.
+ * Checks window.Capacitor.Plugins.LocalNotifications first, falls back to imported LocalNotifications.
+ */
+export function getNativeLocalNotifications(): any {
+  if (!isNativePlatform()) return null;
+  if (typeof window !== 'undefined') {
+    const winCap = (window as any).Capacitor;
+    if (winCap?.Plugins?.LocalNotifications) {
+      return winCap.Plugins.LocalNotifications;
+    }
+  }
+  return LocalNotifications;
 }
 
 /**
@@ -128,12 +152,15 @@ export async function initNotificationActionListener(): Promise<void> {
   listenerInitialized = true;
 
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) return;
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) return;
 
-    await LocalNotifications.addListener('localNotificationActionPerformed', () => {
-      window.location.hash = '#/today';
-    });
+    await withPluginTimeout(
+      plugin.addListener('localNotificationActionPerformed', () => {
+        window.location.hash = '#/today';
+      }),
+      'addListener(localNotificationActionPerformed)'
+    );
   } catch (err) {
     console.warn('Could not register localNotificationActionPerformed listener:', err);
   }
@@ -145,19 +172,22 @@ export async function initNotificationActionListener(): Promise<void> {
 export async function ensureNativeChannel(): Promise<void> {
   if (!isNativePlatform()) return;
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) return;
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) return;
 
-    await LocalNotifications.createChannel({
-      id: CHANNEL_ID,
-      name: 'Daily Writing Reminders',
-      description: 'Reminds you to write your daily reflection in Chronos Journal',
-      importance: 5, // High importance (heads-up notification)
-      visibility: 1, // Public on lock screen
-      lights: true,
-      lightColor: '#10b981',
-      vibration: true,
-    });
+    await withPluginTimeout(
+      plugin.createChannel({
+        id: CHANNEL_ID,
+        name: 'Daily Writing Reminders',
+        description: 'Reminds you to write your daily reflection in Chronos Journal',
+        importance: 5, // High importance (heads-up notification)
+        visibility: 1, // Public on lock screen
+        lights: true,
+        lightColor: '#10b981',
+        vibration: true,
+      }),
+      'createChannel(chronos-daily)'
+    );
   } catch (err) {
     console.warn('Failed to create notification channel:', err);
   }
@@ -169,17 +199,62 @@ export async function ensureNativeChannel(): Promise<void> {
 export async function cancelTodayPendingNotification(): Promise<void> {
   if (!isNativePlatform()) return;
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) return;
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) return;
 
     const todayIso = formatDateToIso(new Date());
     const id = getNotificationIdForDate(todayIso);
-    await LocalNotifications.cancel({
-      notifications: [{ id }],
-    });
+    await withPluginTimeout(
+      plugin.cancel({
+        notifications: [{ id }],
+      }),
+      'cancel(todayNotification)'
+    );
   } catch (err) {
     console.warn('Could not cancel today notification:', err);
   }
+}
+
+/**
+ * Calls LocalNotifications.requestPermissions() directly in native mode,
+ * then calls checkPermissions() again and returns raw results.
+ */
+export async function nativeDirectRequestPermission(): Promise<{
+  requestResult: any;
+  checkResult: any;
+  rawDisplay: string;
+  granted: boolean;
+}> {
+  if (!isNativePlatform()) {
+    throw new Error('nativeDirectRequestPermission is only supported on native platforms');
+  }
+
+  const plugin = getNativeLocalNotifications();
+  if (!plugin) {
+    throw new Error('LocalNotifications plugin is unavailable on this device');
+  }
+
+  // 1. Request permissions with 5-second timeout
+  const reqResult: any = await withPluginTimeout(
+    plugin.requestPermissions(),
+    'LocalNotifications.requestPermissions()'
+  );
+
+  // 2. Check permissions immediately after to verify state
+  const checkResult: any = await withPluginTimeout(
+    plugin.checkPermissions(),
+    'LocalNotifications.checkPermissions()'
+  );
+
+  const rawDisplay = (checkResult?.display || reqResult?.display || 'prompt') as string;
+  const granted = rawDisplay === 'granted';
+
+  return {
+    requestResult: reqResult,
+    checkResult,
+    rawDisplay,
+    granted,
+  };
 }
 
 /**
@@ -194,30 +269,47 @@ export async function scheduleNative7DayReminders(
   }
 
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) {
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) {
       return { success: false, scheduledCount: 0, error: 'LocalNotifications plugin unavailable' };
     }
 
     await ensureNativeChannel();
 
-    // Check permissions strictly via LocalNotifications
-    const permStatus = await LocalNotifications.checkPermissions();
-    if (permStatus.display !== 'granted') {
-      const requested = await LocalNotifications.requestPermissions();
-      if (requested.display !== 'granted') {
-        return { success: false, scheduledCount: 0, error: 'Android notification permission not granted' };
+    // Check permissions strictly via LocalNotifications with 5s timeout
+    const permStatus: any = await withPluginTimeout(
+      plugin.checkPermissions(),
+      'LocalNotifications.checkPermissions()'
+    );
+
+    if (permStatus?.display !== 'granted') {
+      const requested: any = await withPluginTimeout(
+        plugin.requestPermissions(),
+        'LocalNotifications.requestPermissions()'
+      );
+      if (requested?.display !== 'granted') {
+        return { 
+          success: false, 
+          scheduledCount: 0, 
+          error: `Android notification permission not granted (status: "${requested?.display || 'unknown'}")` 
+        };
       }
     }
 
     // Cancel existing pending notifications to refill fresh schedule
     try {
-      const pending = await LocalNotifications.getPending();
+      const pending: any = await withPluginTimeout(
+        plugin.getPending(),
+        'LocalNotifications.getPending()'
+      );
       if (pending && pending.notifications && pending.notifications.length > 0) {
-        // Exclude the 1-minute test ID (999999) if active
-        const toCancel = pending.notifications.filter(n => n.id !== 999999);
+        // Exclude 1-minute test ID (999999) if active
+        const toCancel = pending.notifications.filter((n: any) => n.id !== 999999);
         if (toCancel.length > 0) {
-          await LocalNotifications.cancel({ notifications: toCancel });
+          await withPluginTimeout(
+            plugin.cancel({ notifications: toCancel }),
+            'LocalNotifications.cancel(pending)'
+          );
         }
       }
     } catch (e) {
@@ -230,7 +322,6 @@ export async function scheduleNative7DayReminders(
 
     const [targetHours, targetMinutes] = (settings.time || '21:00').split(':').map(Number);
     const notificationsToSchedule = [];
-
     const now = new Date();
 
     for (let i = 0; i < 7; i++) {
@@ -268,9 +359,12 @@ export async function scheduleNative7DayReminders(
     }
 
     if (notificationsToSchedule.length > 0) {
-      await LocalNotifications.schedule({
-        notifications: notificationsToSchedule,
-      });
+      await withPluginTimeout(
+        plugin.schedule({
+          notifications: notificationsToSchedule,
+        }),
+        'LocalNotifications.schedule(7-day)'
+      );
     }
 
     return { success: true, scheduledCount: notificationsToSchedule.length };
@@ -293,42 +387,55 @@ export async function scheduleTestNotificationIn1Minute(): Promise<{
   }
 
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) {
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) {
       return { success: false, error: 'LocalNotifications plugin is unavailable' };
     }
 
     await ensureNativeChannel();
 
-    // Check / request permission first
-    const permStatus = await LocalNotifications.checkPermissions();
-    if (permStatus.display !== 'granted') {
-      const requested = await LocalNotifications.requestPermissions();
-      if (requested.display !== 'granted') {
-        return { success: false, error: 'Notification permission denied. Please allow notifications in Android settings.' };
+    // Check / request permission first with 5s timeout
+    const permStatus: any = await withPluginTimeout(
+      plugin.checkPermissions(),
+      'LocalNotifications.checkPermissions()'
+    );
+
+    if (permStatus?.display !== 'granted') {
+      const requested: any = await withPluginTimeout(
+        plugin.requestPermissions(),
+        'LocalNotifications.requestPermissions()'
+      );
+      if (requested?.display !== 'granted') {
+        return { 
+          success: false, 
+          error: `Notification permission denied (status: "${requested?.display || 'unknown'}"). Please allow notifications in Android settings.` 
+        };
       }
     }
 
     const testDate = new Date(Date.now() + 60 * 1000);
     const testId = 999999;
 
-    await LocalNotifications.schedule({
-      notifications: [
-        {
-          id: testId,
-          title: 'Chronos Daily Reminder (Test)',
-          body: 'This is your scheduled test reminder from 1 minute ago! Tap here to write today’s reflection.',
-          channelId: CHANNEL_ID,
-          schedule: {
-            at: testDate,
-            allowWhileIdle: true,
+    await withPluginTimeout(
+      plugin.schedule({
+        notifications: [
+          {
+            id: testId,
+            title: 'Chronos Daily Reminder (Test)',
+            body: 'This is your scheduled test reminder from 1 minute ago! Tap here to write today’s reflection.',
+            channelId: CHANNEL_ID,
+            schedule: {
+              at: testDate,
+              allowWhileIdle: true,
+            },
+            extra: {
+              url: '#/today',
+            },
           },
-          extra: {
-            url: '#/today',
-          },
-        },
-      ],
-    });
+        ],
+      }),
+      'LocalNotifications.schedule(1-minute test)'
+    );
 
     const timeStr = testDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     return { success: true, scheduledTime: timeStr };
@@ -364,71 +471,92 @@ export async function syncReminders(
 export async function getNativeDebugInfo(): Promise<{
   isNative: boolean;
   notificationPermission: string;
+  rawPermission: string;
   exactAlarmPermission: string;
   isExactAlarmSupported: boolean;
   pendingCount: number;
   nextScheduledTime?: string;
-  error?: string;
+  lastError?: string;
 }> {
   if (!isNativePlatform()) {
     const webPerm = typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'not supported';
     return {
       isNative: false,
       notificationPermission: webPerm,
+      rawPermission: webPerm,
       exactAlarmPermission: 'n/a',
       isExactAlarmSupported: false,
       pendingCount: 0,
     };
   }
 
+  let lastError: string | undefined = undefined;
+
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (!LocalNotifications) {
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) {
       return {
         isNative: true,
         notificationPermission: 'unavailable',
+        rawPermission: 'unavailable',
         exactAlarmPermission: 'unavailable',
         isExactAlarmSupported: false,
         pendingCount: 0,
-        error: 'Capacitor LocalNotifications plugin not loaded',
+        lastError: 'Capacitor LocalNotifications plugin not loaded',
       };
     }
 
-    // 1. checkPermissions()
-    const perms: any = await LocalNotifications.checkPermissions();
-    const notifPerm = perms?.display || 'prompt';
+    // 1. checkPermissions() with 5s timeout
+    let notifPerm = 'prompt';
+    try {
+      const perms: any = await withPluginTimeout(
+        plugin.checkPermissions(),
+        'LocalNotifications.checkPermissions()'
+      );
+      notifPerm = perms?.display || 'prompt';
+    } catch (e: any) {
+      lastError = e?.message || 'checkPermissions failed';
+      notifPerm = 'error';
+    }
 
-    // 2. checkExactNotificationSetting()
+    // 2. checkExactNotificationSetting() with 5s timeout
     let exactStatus = 'granted';
     let isExactAlarmSupported = false;
-    if (typeof (LocalNotifications as any).checkExactNotificationSetting === 'function') {
+    if (typeof plugin.checkExactNotificationSetting === 'function') {
       isExactAlarmSupported = true;
       try {
-        const exactRes = await (LocalNotifications as any).checkExactNotificationSetting();
+        const exactRes: any = await withPluginTimeout(
+          plugin.checkExactNotificationSetting(),
+          'LocalNotifications.checkExactNotificationSetting()'
+        );
         exactStatus = exactRes?.exact_alarm || 'granted';
-      } catch {
-        exactStatus = 'granted';
+      } catch (e: any) {
+        exactStatus = 'error';
+        if (!lastError) lastError = e?.message || 'checkExactNotificationSetting failed';
       }
     }
 
-    // 3. getPending()
+    // 3. getPending() with 5s timeout
     let pendingCount = 0;
     let nextScheduledTime: string | undefined = undefined;
     try {
-      const pending = await LocalNotifications.getPending();
+      const pending: any = await withPluginTimeout(
+        plugin.getPending(),
+        'LocalNotifications.getPending()'
+      );
       const list = pending?.notifications || [];
       pendingCount = list.length;
 
       const futureDates = list
-        .map(n => {
+        .map((n: any) => {
           if (n.schedule?.at) {
             const d = new Date(n.schedule.at);
             return isNaN(d.getTime()) ? null : d;
           }
           return null;
         })
-        .filter((d): d is Date => d !== null && d.getTime() > Date.now())
-        .sort((a, b) => a.getTime() - b.getTime());
+        .filter((d: any): d is Date => d !== null && d.getTime() > Date.now())
+        .sort((a: Date, b: Date) => a.getTime() - b.getTime());
 
       if (futureDates.length > 0) {
         nextScheduledTime = futureDates[0].toLocaleString([], {
@@ -440,45 +568,30 @@ export async function getNativeDebugInfo(): Promise<{
         });
       }
     } catch (e: any) {
-      console.warn('getPending error:', e);
+      if (!lastError) lastError = e?.message || 'getPending failed';
     }
 
     return {
       isNative: true,
       notificationPermission: notifPerm,
+      rawPermission: notifPerm,
       exactAlarmPermission: exactStatus,
       isExactAlarmSupported,
       pendingCount,
       nextScheduledTime,
+      lastError,
     };
   } catch (err: any) {
     return {
       isNative: true,
       notificationPermission: 'error',
+      rawPermission: 'error',
       exactAlarmPermission: 'error',
       isExactAlarmSupported: false,
       pendingCount: 0,
-      error: err?.message || 'Error checking native status',
+      lastError: err?.message || 'Error checking native status',
     };
   }
-}
-
-/**
- * Checks platform permission details for Settings UI
- */
-export async function getReminderPermissionInfo(): Promise<{
-  isNative: boolean;
-  notificationPermission: string;
-  exactAlarmPermission?: string;
-  isExactAlarmSupported?: boolean;
-}> {
-  const debug = await getNativeDebugInfo();
-  return {
-    isNative: debug.isNative,
-    notificationPermission: debug.notificationPermission,
-    exactAlarmPermission: debug.exactAlarmPermission,
-    isExactAlarmSupported: debug.isExactAlarmSupported,
-  };
 }
 
 /**
@@ -490,15 +603,12 @@ export async function requestPlatformPermission(): Promise<{
 }> {
   if (isNativePlatform()) {
     try {
-      const LocalNotifications = await getNativeLocalNotifications();
-      if (LocalNotifications) {
-        const res = await LocalNotifications.requestPermissions();
-        return {
-          granted: res.display === 'granted',
-          permission: res.display,
-        };
-      }
-    } catch (err) {
+      const res = await nativeDirectRequestPermission();
+      return {
+        granted: res.granted,
+        permission: res.rawDisplay,
+      };
+    } catch {
       return { granted: false, permission: 'denied' };
     }
   }
@@ -520,17 +630,21 @@ export async function requestPlatformPermission(): Promise<{
 }
 
 /**
- * Redirects user to exact alarm settings if needed (Android 12+)
+ * Redirects user to exact alarm settings if needed (Android 12+) with 5s timeout
  */
 export async function requestExactAlarmSettings(): Promise<void> {
   if (!isNativePlatform()) return;
   try {
-    const LocalNotifications = await getNativeLocalNotifications();
-    if (LocalNotifications && typeof (LocalNotifications as any).changeExactNotificationSetting === 'function') {
-      await (LocalNotifications as any).changeExactNotificationSetting();
+    const plugin = getNativeLocalNotifications();
+    if (plugin && typeof plugin.changeExactNotificationSetting === 'function') {
+      await withPluginTimeout(
+        plugin.changeExactNotificationSetting(),
+        'LocalNotifications.changeExactNotificationSetting()'
+      );
     }
   } catch (err) {
     console.warn('Could not open exact alarm setting:', err);
+    throw err;
   }
 }
 
@@ -541,9 +655,10 @@ export function isNotificationSupported(): boolean {
 
 export function triggerBrowserNotification(title: string, body: string, onClick?: () => void) {
   if (isNativePlatform()) {
-    getNativeLocalNotifications().then((LocalNotifications) => {
-      if (LocalNotifications) {
-        LocalNotifications.schedule({
+    const plugin = getNativeLocalNotifications();
+    if (plugin) {
+      withPluginTimeout(
+        plugin.schedule({
           notifications: [
             {
               id: Math.floor(Math.random() * 1000000),
@@ -553,9 +668,10 @@ export function triggerBrowserNotification(title: string, body: string, onClick?
               schedule: { at: new Date(Date.now() + 500) },
             },
           ],
-        }).catch((err) => console.warn('Native notification trigger failed:', err));
-      }
-    }).catch(() => {});
+        }),
+        'LocalNotifications.schedule(triggerBrowserNotification)'
+      ).catch((err) => console.warn('Native notification trigger failed:', err));
+    }
     return;
   }
 
@@ -583,11 +699,7 @@ export function triggerBrowserNotification(title: string, body: string, onClick?
 }
 
 /**
- * Web polling reminder:
- * - Uses local date (formatDateToIso).
- * - Fires at most once per day via lastNotifiedDate check in localStorage & settings.
- * - Skips if today's entry already has content.
- * - Uses currentTime >= settings.time so if opened after the reminder time, shows a single notification.
+ * Web polling reminder
  */
 export function checkAndTriggerReminder(
   settings: ReminderSettings,
@@ -600,7 +712,6 @@ export function checkAndTriggerReminder(
   const now = new Date();
   const todayIso = formatDateToIso(now);
 
-  // Check in-memory setting and persistent localStorage
   const storedLastNotified = typeof window !== 'undefined' ? localStorage.getItem('chronos_last_notified_date') : null;
   if (settings.lastNotifiedDate === todayIso || storedLastNotified === todayIso) {
     return false;
@@ -610,9 +721,7 @@ export function checkAndTriggerReminder(
   const currentMinutes = String(now.getMinutes()).padStart(2, '0');
   const currentTime = `${currentHours}:${currentMinutes}`;
 
-  // If current local time has reached or passed settings.time today
   if (currentTime >= (settings.time || '21:00')) {
-    // Record in localStorage immediately so it never fires more than once today
     if (typeof window !== 'undefined') {
       localStorage.setItem('chronos_last_notified_date', todayIso);
     }

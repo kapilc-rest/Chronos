@@ -21,7 +21,7 @@ import { usePWAInstall } from '../usePWAInstall';
 import { ReminderSettings, StorageConfig, JournalEntry } from '../types';
 import { 
   getNativeDebugInfo,
-  requestPlatformPermission,
+  nativeDirectRequestPermission,
   requestExactAlarmSettings,
   scheduleNative7DayReminders,
   scheduleTestNotificationIn1Minute,
@@ -65,6 +65,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [reminders, setReminders] = useState<ReminderSettings>(reminderSettings);
   const [cfg, setCfg] = useState<StorageConfig>(config);
   const [notificationPermission, setNotificationPermission] = useState<string>('default');
+  const [rawPermValue, setRawPermValue] = useState<string>('prompt');
+  const [lastError, setLastError] = useState<string | undefined>(undefined);
   const [copiedSchema, setCopiedSchema] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isSchedulingTest, setIsSchedulingTest] = useState(false);
@@ -75,14 +77,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [nativeDebug, setNativeDebug] = useState<{
     isNative: boolean;
     notificationPermission: string;
+    rawPermission: string;
     exactAlarmPermission: string;
     isExactAlarmSupported: boolean;
     pendingCount: number;
     nextScheduledTime?: string;
-    error?: string;
+    lastError?: string;
   }>({
     isNative: isNativePlatform(),
     notificationPermission: 'default',
+    rawPermission: 'prompt',
     exactAlarmPermission: 'granted',
     isExactAlarmSupported: false,
     pendingCount: 0,
@@ -98,7 +102,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       const debug = await getNativeDebugInfo();
       setNativeDebug(debug);
       setNotificationPermission(debug.notificationPermission);
+      setRawPermValue(debug.rawPermission);
+      if (debug.lastError) {
+        setLastError(debug.lastError);
+      }
     } catch (err: any) {
+      const msg = err?.message || String(err);
+      setLastError(msg);
       console.warn('Could not refresh native debug info:', err);
     }
   };
@@ -113,33 +123,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Request platform permission (Native Android via LocalNotifications or Web Notification)
+  // Requirement 1: Make Request Permission call LocalNotifications.requestPermissions() directly
+  // in its click handler (no web Notification API in native mode), then call checkPermissions() again
+  // and show the raw result value in a toast.
   const handleRequestPermission = async () => {
     try {
-      const res = await requestPlatformPermission();
-      setNotificationPermission(res.permission);
-      await refreshDebugInfo();
-      if (res.granted) {
-        onShowToast('Notifications Enabled!', 'Notification permissions have been granted.', 'success');
-        // Immediately schedule the next 7 days right away after permission is granted
-        if (nativeDebug.isNative && reminders.enabled) {
-          try {
-            const scheduleRes = await scheduleNative7DayReminders(reminders, hasTodayEntry);
-            if (scheduleRes.success) {
-              onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
-            } else if (scheduleRes.error) {
-              onShowToast('Scheduling Failed', scheduleRes.error, 'error');
-            }
-          } catch (err: any) {
-            onShowToast('Scheduling Error', err?.message || 'Failed to schedule native reminders', 'error');
-          }
+      if (isNativePlatform()) {
+        const res = await nativeDirectRequestPermission();
+        setNotificationPermission(res.rawDisplay);
+        setRawPermValue(res.rawDisplay);
+        setLastError(undefined);
+        onShowToast(
+          'Permission Result',
+          `Raw status: "${res.rawDisplay}"`,
+          res.granted ? 'success' : 'info'
+        );
+
+        if (res.granted && reminders.enabled) {
+          scheduleNative7DayReminders(reminders, hasTodayEntry)
+            .then(scheduleRes => {
+              if (scheduleRes.success) {
+                onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
+              } else if (scheduleRes.error) {
+                setLastError(scheduleRes.error);
+                onShowToast('Scheduling Failed', scheduleRes.error, 'error');
+              }
+            })
+            .catch(e => {
+              const msg = e?.message || String(e);
+              setLastError(msg);
+              onShowToast('Scheduling Error', msg, 'error');
+            });
         }
-        await refreshDebugInfo();
       } else {
-        onShowToast('Permission Denied', 'Please enable notifications in Android / browser settings.', 'error');
+        if (typeof window !== 'undefined' && 'Notification' in window) {
+          const perm = await Notification.requestPermission();
+          setNotificationPermission(perm);
+          setRawPermValue(perm);
+          onShowToast('Permission Result', `Browser notification permission: "${perm}"`, perm === 'granted' ? 'success' : 'info');
+        } else {
+          onShowToast('Not Supported', 'Web Notification API is not supported in this browser.', 'info');
+        }
       }
+      await refreshDebugInfo().catch(() => {});
     } catch (err: any) {
-      onShowToast('Permission Error', err?.message || 'Could not request notification permission.', 'error');
+      const errMsg = err?.message || String(err);
+      setLastError(errMsg);
+      onShowToast('Permission Error', errMsg, 'error');
     }
   };
 
@@ -151,39 +181,46 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (nativeDebug.isNative) {
       if (enabled) {
         try {
-          let currentPerm = notificationPermission;
-          // Request permission automatically when reminder toggle is turned on
-          if (currentPerm !== 'granted') {
-            const res = await requestPlatformPermission();
-            currentPerm = res.permission;
-            setNotificationPermission(res.permission);
-            if (res.granted) {
-              onShowToast('Permission Granted', 'Android notifications enabled.', 'success');
-            } else {
-              onShowToast('Permission Denied', 'Please enable notifications in Android Settings to receive reminders.', 'error');
-            }
+          if (rawPermValue !== 'granted') {
+            const res = await nativeDirectRequestPermission();
+            setNotificationPermission(res.rawDisplay);
+            setRawPermValue(res.rawDisplay);
+            onShowToast('Permission Result', `Raw status: "${res.rawDisplay}"`, res.granted ? 'success' : 'info');
           }
 
-          if (currentPerm === 'granted') {
-            const scheduleRes = await scheduleNative7DayReminders(updated, hasTodayEntry);
-            if (scheduleRes.success) {
-              onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
-            } else if (scheduleRes.error) {
-              onShowToast('Scheduling Failed', scheduleRes.error, 'error');
-            }
-          }
-          await refreshDebugInfo();
+          scheduleNative7DayReminders(updated, hasTodayEntry)
+            .then(scheduleRes => {
+              if (scheduleRes.success) {
+                onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
+              } else if (scheduleRes.error) {
+                setLastError(scheduleRes.error);
+                onShowToast('Scheduling Failed', scheduleRes.error, 'error');
+              }
+            })
+            .catch(err => {
+              const msg = err?.message || String(err);
+              setLastError(msg);
+              onShowToast('Scheduling Error', msg, 'error');
+            })
+            .finally(() => {
+              refreshDebugInfo().catch(() => {});
+            });
         } catch (err: any) {
-          onShowToast('Scheduling Error', err?.message || 'Failed to schedule reminders', 'error');
+          const errMsg = err?.message || String(err);
+          setLastError(errMsg);
+          onShowToast('Permission Error', errMsg, 'error');
         }
       } else {
-        try {
-          await scheduleNative7DayReminders(updated, hasTodayEntry);
-          await refreshDebugInfo();
-          onShowToast('Reminders Paused', 'Daily reminder notifications disabled.', 'info');
-        } catch (err: any) {
-          onShowToast('Error', err?.message || 'Failed to cancel reminders', 'error');
-        }
+        scheduleNative7DayReminders(updated, hasTodayEntry)
+          .catch(err => {
+            const msg = err?.message || String(err);
+            setLastError(msg);
+            onShowToast('Error', msg, 'error');
+          })
+          .finally(() => {
+            refreshDebugInfo().catch(() => {});
+          });
+        onShowToast('Reminders Paused', 'Daily reminder notifications disabled.', 'info');
       }
     }
   };
@@ -193,12 +230,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       await requestExactAlarmSettings();
       await refreshDebugInfo();
+      onShowToast('Alarm Settings', 'Please ensure Chronos is allowed to schedule exact alarms.', 'info');
     } catch (err: any) {
-      onShowToast('Error', err?.message || 'Could not open exact alarm settings', 'error');
+      const errMsg = err?.message || String(err);
+      setLastError(errMsg);
+      onShowToast('Error', errMsg, 'error');
     }
   };
 
-  // Schedule Test in 1 Minute (Native)
+  // Requirement 4: Use try/finally so the "Scheduling..." button always resets
   const handleScheduleTest1Minute = async () => {
     setIsSchedulingTest(true);
     try {
@@ -206,47 +246,61 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (res.success) {
         onShowToast(
           'Test Reminder Scheduled',
-          `Alert scheduled for ${res.scheduledTime || 'in 1 minute'}. You may minimize or lock your phone.`,
+          `Alert scheduled for ${res.scheduledTime || 'in 1 minute'}. You may lock or background your phone.`,
           'success'
         );
-        await refreshDebugInfo();
       } else {
-        onShowToast('Test Schedule Failed', res.error || 'Could not schedule 1-minute test.', 'error');
+        const errText = res.error || 'Could not schedule 1-minute test.';
+        setLastError(errText);
+        onShowToast('Test Schedule Failed', errText, 'error');
       }
     } catch (err: any) {
-      onShowToast('Test Error', err?.message || 'Could not schedule test', 'error');
+      const errMsg = err?.message || String(err);
+      setLastError(errMsg);
+      onShowToast('Test Schedule Error', errMsg, 'error');
     } finally {
       setIsSchedulingTest(false);
+      await refreshDebugInfo().catch(() => {});
     }
   };
 
-  // Test Notification & Chime (Immediate)
+  // Test Notification & Chime (Immediate web/chime test)
   const handleTestNotification = () => {
     if (reminders.sound) {
       playHarmonicChime();
     }
     triggerBrowserNotification(
       'Daily Journal Reflection Test',
-      'This is a sample alert! Your daily reminder is configured and working perfectly.'
+      'This is a sample alert! Your daily reminder is configured and working.'
     );
     onShowToast('Test Reminder Triggered', 'Harmonic chime played and notification triggered.', 'success');
   };
 
-  // Save Settings
-  const handleSave = async () => {
-    try {
-      onSaveReminders(reminders);
-      onSaveConfig(cfg);
-      if (nativeDebug.isNative) {
-        const scheduleRes = await scheduleNative7DayReminders(reminders, hasTodayEntry);
-        if (!scheduleRes.success && scheduleRes.error) {
-          onShowToast('Scheduling Warning', scheduleRes.error, 'error');
-        }
-      }
-      onShowToast('Settings Saved', 'All preferences have been updated.', 'success');
-      onClose();
-    } catch (err: any) {
-      onShowToast('Save Error', err?.message || 'Failed to save settings', 'error');
+  // Requirement 3: Never block Save Preferences on native calls:
+  // save the settings and close the modal first, then do native scheduling in the background with try/catch.
+  const handleSave = () => {
+    // 1. Immediately save settings and close modal FIRST
+    onSaveReminders(reminders);
+    onSaveConfig(cfg);
+    onShowToast('Settings Saved', 'All preferences have been updated.', 'success');
+    onClose();
+
+    // 2. Perform native scheduling in background - NEVER blocks UI or modal close
+    if (nativeDebug.isNative) {
+      setTimeout(() => {
+        scheduleNative7DayReminders(reminders, hasTodayEntry)
+          .then(scheduleRes => {
+            if (!scheduleRes.success && scheduleRes.error) {
+              setLastError(scheduleRes.error);
+              onShowToast('Reminder Notice', scheduleRes.error, 'error');
+            }
+          })
+          .catch(err => {
+            const msg = err?.message || String(err);
+            setLastError(msg);
+            onShowToast('Native Scheduling Error', msg, 'error');
+          });
+      }, 50);
     }
   };
 
@@ -300,7 +354,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       return false;
     }
 
-    // Validate that items are objects with date and content
     const validItems = parsed.filter(
       item => item && typeof item === 'object' && typeof item.date === 'string' && typeof item.content === 'string'
     );
@@ -310,7 +363,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       return false;
     }
 
-    // Index existing entries by date for merging
     const entryMap = new Map<string, JournalEntry>();
     entries.forEach(e => entryMap.set(e.date, { ...e }));
 
@@ -386,7 +438,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
     };
     reader.readAsText(file);
-    e.target.value = ''; // Reset input to allow re-uploading same file if desired
+    e.target.value = '';
   };
 
   // Import JSON via pasted text fallback
@@ -505,17 +557,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               {/* Android 13+ Notification Permission Alert Banner (if denied) */}
-              {nativeDebug.isNative && notificationPermission === 'denied' && (
+              {nativeDebug.isNative && rawPermValue === 'denied' && (
                 <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-700 dark:text-rose-400 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div className="flex items-start gap-2">
                     <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
-                    <span>Android 13+ notification permission is blocked. Scheduled daily reminders will not appear until notifications are enabled in Android Settings.</span>
+                    <span>Android notification permission is denied. Notifications will not appear until enabled.</span>
                   </div>
                   <button
                     onClick={handleRequestPermission}
                     className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shrink-0 transition-colors"
                   >
-                    Allow Notifications
+                    Request Permission
                   </button>
                 </div>
               )}
@@ -536,7 +588,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               )}
 
-              {/* Native Android Status & Diagnostics Area (Requirement 3) */}
+              {/* Requirement 5: Native Android Diagnostics Card with raw permission value & last error */}
               {nativeDebug.isNative && (
                 <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-3">
                   <div className="flex items-center justify-between">
@@ -548,7 +600,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                     <button
                       onClick={refreshDebugInfo}
-                      className="text-[11px] px-2 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 flex items-center gap-1 transition-colors"
+                      className="text-[11px] px-2 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 flex items-center gap-1 transition-colors cursor-pointer"
                       title="Refresh status from LocalNotifications"
                     >
                       <RefreshCw className="w-3 h-3" />
@@ -557,19 +609,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                    {/* Raw Notification Permission Value */}
                     <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                      <span className="block text-[10px] text-slate-400 font-medium">Notification Perm</span>
-                      <span className={`inline-block mt-1 px-1.5 py-0.5 rounded text-[11px] font-mono font-semibold ${
-                        notificationPermission === 'granted'
-                          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                          : notificationPermission === 'denied'
-                          ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
-                          : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                      <span className="block text-[10px] text-slate-400 font-medium">Raw Plugin Perm</span>
+                      <span className={`inline-block mt-1 px-1.5 py-0.5 rounded text-[11px] font-mono font-bold ${
+                        rawPermValue === 'granted'
+                          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+                          : rawPermValue === 'denied'
+                          ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20'
+                          : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
                       }`}>
-                        {notificationPermission}
+                        {rawPermValue}
                       </span>
                     </div>
 
+                    {/* Exact Alarm Setting */}
                     <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
                       <span className="block text-[10px] text-slate-400 font-medium">Exact Alarm Setting</span>
                       <div className="flex items-center gap-1 mt-1">
@@ -591,6 +645,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </div>
                     </div>
 
+                    {/* Pending Notifications Count */}
                     <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
                       <span className="block text-[10px] text-slate-400 font-medium">Pending Alerts</span>
                       <span className="block mt-1 text-[12px] font-mono font-bold text-slate-800 dark:text-slate-200">
@@ -598,6 +653,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </span>
                     </div>
 
+                    {/* Next Scheduled Reminder Time */}
                     <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
                       <span className="block text-[10px] text-slate-400 font-medium">Next Scheduled</span>
                       <span className="block mt-1 text-[11px] font-medium text-slate-700 dark:text-slate-300 truncate" title={nativeDebug.nextScheduledTime || 'None pending'}>
@@ -606,7 +662,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
 
-                  {/* 1-Minute Test Scheduling Button */}
+                  {/* Last Error Banner */}
+                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-400 font-medium uppercase tracking-wider">Last Plugin Error</span>
+                      {lastError && (
+                        <button
+                          onClick={() => setLastError(undefined)}
+                          className="text-[10px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 underline"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                    {lastError ? (
+                      <div className="mt-1 flex items-start gap-1.5 text-rose-600 dark:text-rose-400">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        <span className="text-[11px] font-mono break-all leading-tight">{lastError}</span>
+                      </div>
+                    ) : (
+                      <span className="block mt-1 text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
+                        None (all plugin calls healthy)
+                      </span>
+                    )}
+                  </div>
+
+                  {/* 1-Minute Test Scheduling Button with try/finally guarantee */}
                   <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/60 dark:border-slate-800/60">
                     <span className="text-[11px] text-slate-500 dark:text-slate-400">
                       Test background wake-up while app is minimized or device is locked:
@@ -614,7 +695,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <button
                       onClick={handleScheduleTest1Minute}
                       disabled={isSchedulingTest}
-                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
                     >
                       <Clock className="w-3.5 h-3.5" />
                       <span>{isSchedulingTest ? 'Scheduling...' : 'Schedule test in 1 minute'}</span>
@@ -677,32 +758,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Web Permission Status Box (Shown on web or if permission not granted) */}
+              {/* Permission Status Box with direct Request Permission button */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
                       Notification Permission:
                     </span>
-                    <span className={`text-xs px-2 py-0.5 rounded font-mono ${
-                      notificationPermission === 'granted'
+                    <span className={`text-xs px-2 py-0.5 rounded font-mono font-semibold ${
+                      rawPermValue === 'granted'
                         ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                        : notificationPermission === 'denied'
+                        : rawPermValue === 'denied'
                         ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
                         : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
                     }`}>
-                      {notificationPermission}
+                      {rawPermValue}
                     </span>
                   </div>
 
-                  {notificationPermission !== 'granted' && isNotificationSupported() && (
-                    <button
-                      onClick={handleRequestPermission}
-                      className="px-3 py-1 text-xs font-medium rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors"
-                    >
-                      Request Permission
-                    </button>
-                  )}
+                  <button
+                    onClick={handleRequestPermission}
+                    className="px-3 py-1 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer shadow-xs"
+                  >
+                    Request Permission
+                  </button>
                 </div>
 
                 <div className="pt-2 flex items-center justify-between border-t border-slate-200/60 dark:border-slate-800/60">
@@ -711,7 +790,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </span>
                   <button
                     onClick={handleTestNotification}
-                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-200 flex items-center gap-1.5 transition-colors"
+                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer"
                   >
                     <Play className="w-3.5 h-3.5 text-emerald-500" />
                     <span>Test Reminder Now</span>
@@ -846,7 +925,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           )}
 
-          {/* TAB 4: Backup & Data (Requirements 2: Android-friendly file input, paste JSON, merge by date) */}
+          {/* TAB 4: Backup & Data */}
           {activeTab === 'backup' && (
             <div className="space-y-5">
               {/* Export Section */}
@@ -862,7 +941,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </p>
                 <button
                   onClick={handleExportJson}
-                  className="px-4 py-2 text-xs font-medium rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors flex items-center gap-1.5"
+                  className="px-4 py-2 text-xs font-medium rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors flex items-center gap-1.5 cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
                   <span>Download Backup File ({entries.length} entries)</span>
@@ -923,7 +1002,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <button
                       onClick={handleImportPastedJson}
                       disabled={!pastedJson.trim()}
-                      className="px-4 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                      className="px-4 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 cursor-pointer"
                     >
                       <Upload className="w-3.5 h-3.5" />
                       <span>Import &amp; Merge Pasted JSON</span>
@@ -972,13 +1051,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="px-6 py-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-end gap-3 bg-slate-50/50 dark:bg-slate-900/80">
           <button
             onClick={onClose}
-            className="px-4 py-2 text-xs font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors"
+            className="px-4 py-2 text-xs font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors cursor-pointer"
           >
             Cancel
           </button>
           <button
             onClick={handleSave}
-            className="px-5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg shadow-xs transition-colors"
+            className="px-5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg shadow-xs transition-colors cursor-pointer"
           >
             Save Preferences
           </button>
