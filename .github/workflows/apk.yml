@@ -22,17 +22,18 @@ jobs:
         run: |
           sed -i 's#</manifest>#<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/><uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/></manifest>#' android/app/src/main/AndroidManifest.xml
       - run: npx cap sync android
-      - name: Use permanent signing key
+      - run: cd android && ./gradlew assembleDebug
+      - name: Sign APK with permanent key
         env:
           KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
           KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
-          mkdir -p ~/.android
-          echo "$KS_B64" | base64 -d > ~/.android/debug.keystore
-          keytool -changealias -keystore ~/.android/debug.keystore -alias chronos -destalias androiddebugkey -storepass "$KS_PASS"
-          keytool -storepasswd -keystore ~/.android/debug.keystore -storepass "$KS_PASS" -new android
-      - run: cd android && ./gradlew assembleDebug
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/chronos.keystore"
+          APKSIGNER=$(ls $ANDROID_HOME/build-tools/*/apksigner | sort -V | tail -1)
+          mkdir -p signed
+          "$APKSIGNER" sign --ks "$RUNNER_TEMP/chronos.keystore" --ks-key-alias chronos --ks-pass env:KS_PASS --key-pass env:KS_PASS --out signed/app-debug.apk android/app/build/outputs/apk/debug/app-debug.apk
+          "$APKSIGNER" verify --print-certs signed/app-debug.apk
       - uses: actions/upload-artifact@v4
         with:
           name: chronos-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: signed/app-debug.apk
