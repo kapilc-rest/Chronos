@@ -15,7 +15,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-      - run: npm install
+      - run: npm install --legacy-peer-deps
       - run: npm run build
       - run: npx cap add android
       - name: Add notification permissions
