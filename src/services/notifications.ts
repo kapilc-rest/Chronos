@@ -196,24 +196,32 @@ export async function scheduleNative7DayReminders(
   try {
     const LocalNotifications = await getNativeLocalNotifications();
     if (!LocalNotifications) {
-      return { success: false, scheduledCount: 0, error: 'Plugin unavailable' };
+      return { success: false, scheduledCount: 0, error: 'LocalNotifications plugin unavailable' };
     }
 
     await ensureNativeChannel();
 
-    // Check / Request permissions
+    // Check permissions strictly via LocalNotifications
     const permStatus = await LocalNotifications.checkPermissions();
     if (permStatus.display !== 'granted') {
       const requested = await LocalNotifications.requestPermissions();
       if (requested.display !== 'granted') {
-        return { success: false, scheduledCount: 0, error: 'Notification permission not granted' };
+        return { success: false, scheduledCount: 0, error: 'Android notification permission not granted' };
       }
     }
 
-    // Cancel existing pending notifications in our range to avoid duplicates
-    const pending = await LocalNotifications.getPending();
-    if (pending && pending.notifications && pending.notifications.length > 0) {
-      await LocalNotifications.cancel({ notifications: pending.notifications });
+    // Cancel existing pending notifications to refill fresh schedule
+    try {
+      const pending = await LocalNotifications.getPending();
+      if (pending && pending.notifications && pending.notifications.length > 0) {
+        // Exclude the 1-minute test ID (999999) if active
+        const toCancel = pending.notifications.filter(n => n.id !== 999999);
+        if (toCancel.length > 0) {
+          await LocalNotifications.cancel({ notifications: toCancel });
+        }
+      }
+    } catch (e) {
+      console.warn('Could not clear pending before scheduling:', e);
     }
 
     if (!settings.enabled) {
@@ -273,21 +281,185 @@ export async function scheduleNative7DayReminders(
 }
 
 /**
+ * Schedules a one-time test notification 60 seconds into the future for verification
+ */
+export async function scheduleTestNotificationIn1Minute(): Promise<{
+  success: boolean;
+  scheduledTime?: string;
+  error?: string;
+}> {
+  if (!isNativePlatform()) {
+    return { success: false, error: 'Only available on native Android platform' };
+  }
+
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) {
+      return { success: false, error: 'LocalNotifications plugin is unavailable' };
+    }
+
+    await ensureNativeChannel();
+
+    // Check / request permission first
+    const permStatus = await LocalNotifications.checkPermissions();
+    if (permStatus.display !== 'granted') {
+      const requested = await LocalNotifications.requestPermissions();
+      if (requested.display !== 'granted') {
+        return { success: false, error: 'Notification permission denied. Please allow notifications in Android settings.' };
+      }
+    }
+
+    const testDate = new Date(Date.now() + 60 * 1000);
+    const testId = 999999;
+
+    await LocalNotifications.schedule({
+      notifications: [
+        {
+          id: testId,
+          title: 'Chronos Daily Reminder (Test)',
+          body: 'This is your scheduled test reminder from 1 minute ago! Tap here to write today’s reflection.',
+          channelId: CHANNEL_ID,
+          schedule: {
+            at: testDate,
+            allowWhileIdle: true,
+          },
+          extra: {
+            url: '#/today',
+          },
+        },
+      ],
+    });
+
+    const timeStr = testDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return { success: true, scheduledTime: timeStr };
+  } catch (err: any) {
+    console.error('Failed to schedule 1-minute test:', err);
+    return { success: false, error: err?.message || 'Failed to schedule 1-minute test' };
+  }
+}
+
+/**
  * High-level helper called when app opens, settings change, or entry is saved
  */
 export async function syncReminders(
   settings: ReminderSettings,
   hasTodayEntry: boolean
-): Promise<void> {
-  if (!isNativePlatform()) return;
+): Promise<{ success: boolean; scheduledCount?: number; error?: string }> {
+  if (!isNativePlatform()) return { success: true };
   try {
     await initNotificationActionListener();
     if (hasTodayEntry) {
       await cancelTodayPendingNotification();
     }
-    await scheduleNative7DayReminders(settings, hasTodayEntry);
-  } catch (err) {
+    return await scheduleNative7DayReminders(settings, hasTodayEntry);
+  } catch (err: any) {
     console.warn('Native reminder sync caught error:', err);
+    return { success: false, error: err?.message || 'Failed to sync reminders' };
+  }
+}
+
+/**
+ * Retrieves detailed debug information for the Native Settings UI
+ */
+export async function getNativeDebugInfo(): Promise<{
+  isNative: boolean;
+  notificationPermission: string;
+  exactAlarmPermission: string;
+  isExactAlarmSupported: boolean;
+  pendingCount: number;
+  nextScheduledTime?: string;
+  error?: string;
+}> {
+  if (!isNativePlatform()) {
+    const webPerm = typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'not supported';
+    return {
+      isNative: false,
+      notificationPermission: webPerm,
+      exactAlarmPermission: 'n/a',
+      isExactAlarmSupported: false,
+      pendingCount: 0,
+    };
+  }
+
+  try {
+    const LocalNotifications = await getNativeLocalNotifications();
+    if (!LocalNotifications) {
+      return {
+        isNative: true,
+        notificationPermission: 'unavailable',
+        exactAlarmPermission: 'unavailable',
+        isExactAlarmSupported: false,
+        pendingCount: 0,
+        error: 'Capacitor LocalNotifications plugin not loaded',
+      };
+    }
+
+    // 1. checkPermissions()
+    const perms: any = await LocalNotifications.checkPermissions();
+    const notifPerm = perms?.display || 'prompt';
+
+    // 2. checkExactNotificationSetting()
+    let exactStatus = 'granted';
+    let isExactAlarmSupported = false;
+    if (typeof (LocalNotifications as any).checkExactNotificationSetting === 'function') {
+      isExactAlarmSupported = true;
+      try {
+        const exactRes = await (LocalNotifications as any).checkExactNotificationSetting();
+        exactStatus = exactRes?.exact_alarm || 'granted';
+      } catch {
+        exactStatus = 'granted';
+      }
+    }
+
+    // 3. getPending()
+    let pendingCount = 0;
+    let nextScheduledTime: string | undefined = undefined;
+    try {
+      const pending = await LocalNotifications.getPending();
+      const list = pending?.notifications || [];
+      pendingCount = list.length;
+
+      const futureDates = list
+        .map(n => {
+          if (n.schedule?.at) {
+            const d = new Date(n.schedule.at);
+            return isNaN(d.getTime()) ? null : d;
+          }
+          return null;
+        })
+        .filter((d): d is Date => d !== null && d.getTime() > Date.now())
+        .sort((a, b) => a.getTime() - b.getTime());
+
+      if (futureDates.length > 0) {
+        nextScheduledTime = futureDates[0].toLocaleString([], {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+      }
+    } catch (e: any) {
+      console.warn('getPending error:', e);
+    }
+
+    return {
+      isNative: true,
+      notificationPermission: notifPerm,
+      exactAlarmPermission: exactStatus,
+      isExactAlarmSupported,
+      pendingCount,
+      nextScheduledTime,
+    };
+  } catch (err: any) {
+    return {
+      isNative: true,
+      notificationPermission: 'error',
+      exactAlarmPermission: 'error',
+      isExactAlarmSupported: false,
+      pendingCount: 0,
+      error: err?.message || 'Error checking native status',
+    };
   }
 }
 
@@ -300,50 +472,12 @@ export async function getReminderPermissionInfo(): Promise<{
   exactAlarmPermission?: string;
   isExactAlarmSupported?: boolean;
 }> {
-  if (isNativePlatform()) {
-    try {
-      const LocalNotifications = await getNativeLocalNotifications();
-      if (!LocalNotifications) {
-        return { isNative: true, notificationPermission: 'prompt' };
-      }
-
-      const perms: any = await LocalNotifications.checkPermissions();
-      let exactStatus: string = 'granted';
-      let isExactAlarmSupported = false;
-
-      if (typeof (LocalNotifications as any).checkExactNotificationSetting === 'function') {
-        isExactAlarmSupported = true;
-        try {
-          const exactRes = await (LocalNotifications as any).checkExactNotificationSetting();
-          exactStatus = exactRes?.exact_alarm || 'granted';
-        } catch {
-          exactStatus = 'granted';
-        }
-      }
-
-      return {
-        isNative: true,
-        notificationPermission: perms?.display || 'prompt',
-        exactAlarmPermission: exactStatus,
-        isExactAlarmSupported,
-      };
-    } catch {
-      return {
-        isNative: true,
-        notificationPermission: 'prompt',
-        exactAlarmPermission: 'granted',
-      };
-    }
-  }
-
-  // Web fallback (pure browser)
-  const webPerm = typeof window !== 'undefined' && 'Notification' in window
-    ? Notification.permission
-    : 'denied';
-
+  const debug = await getNativeDebugInfo();
   return {
-    isNative: false,
-    notificationPermission: webPerm,
+    isNative: debug.isNative,
+    notificationPermission: debug.notificationPermission,
+    exactAlarmPermission: debug.exactAlarmPermission,
+    isExactAlarmSupported: debug.isExactAlarmSupported,
   };
 }
 
@@ -364,7 +498,7 @@ export async function requestPlatformPermission(): Promise<{
           permission: res.display,
         };
       }
-    } catch {
+    } catch (err) {
       return { granted: false, permission: 'denied' };
     }
   }

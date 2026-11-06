@@ -261,8 +261,18 @@ export default function App() {
 
     // When today's entry is saved with content, cancel today's pending notification & re-fill 7-day schedule
     if (entry.content && entry.content.trim().length > 0) {
-      cancelTodayPendingNotification();
-      syncReminders(reminderSettings, true);
+      try {
+        cancelTodayPendingNotification();
+        syncReminders(reminderSettings, true).then(res => {
+          if (!res.success && res.error) {
+            showToast('Reminder Notice', res.error, 'error');
+          }
+        }).catch(err => {
+          showToast('Reminder Error', err?.message || 'Could not update reminder schedule', 'error');
+        });
+      } catch (err: any) {
+        showToast('Reminder Error', err?.message || 'Could not update reminder schedule', 'error');
+      }
     }
 
     // Cloud sync if enabled
@@ -298,12 +308,19 @@ export default function App() {
   };
 
   // Save Settings Handlers
-  const handleSaveReminders = (newSettings: ReminderSettings) => {
+  const handleSaveReminders = async (newSettings: ReminderSettings) => {
     setReminderSettings(newSettings);
     saveReminderSettings(newSettings);
     const todayIso = formatDateToIso(new Date());
     const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
-    syncReminders(newSettings, hasTodayEntry);
+    try {
+      const res = await syncReminders(newSettings, hasTodayEntry);
+      if (!res.success && res.error) {
+        showToast('Reminder Notice', res.error, 'error');
+      }
+    } catch (err: any) {
+      showToast('Reminder Sync Error', err?.message || 'Could not schedule native reminders', 'error');
+    }
   };
 
   const handleSaveConfig = (newConfig: StorageConfig) => {
