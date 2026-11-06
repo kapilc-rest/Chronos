@@ -20,7 +20,13 @@ import {
   deleteEntryFromCloud,
 } from './services/storage';
 import { formatDateToIso } from './services/markdown';
-import { checkAndTriggerReminder, syncReminders, cancelTodayPendingNotification } from './services/notifications';
+import { 
+  checkAndTriggerReminder, 
+  syncReminders, 
+  cancelTodayPendingNotification,
+  cancelAllPendingNotifications,
+  initForegroundResumeListener 
+} from './services/notifications';
 import { getCurrentUser, logoutUser } from './services/auth';
 
 export default function App() {
@@ -191,6 +197,23 @@ export default function App() {
     return () => clearInterval(interval);
   }, [authUser, reminderSettings, entries, showToast]);
 
+  // When app returns to foreground, re-check permissions and schedule next 7 days if granted
+  useEffect(() => {
+    if (!authUser) return;
+
+    const cleanup = initForegroundResumeListener(async (isGranted) => {
+      if (isGranted && reminderSettings.enabled) {
+        const todayIso = formatDateToIso(new Date());
+        const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
+        syncReminders(reminderSettings, hasTodayEntry).catch(e => {
+          console.warn('Foreground sync error:', e);
+        });
+      }
+    });
+
+    return () => cleanup();
+  }, [authUser, reminderSettings, entries]);
+
   // Handlers for Navigation
   const navigateToView = (view: 'calendar' | 'blog') => {
     setCurrentView(view);
@@ -314,15 +337,19 @@ export default function App() {
     const todayIso = formatDateToIso(new Date());
     const hasTodayEntry = entries.some(e => e.date === todayIso && e.content && e.content.trim().length > 0);
     setTimeout(() => {
-      syncReminders(newSettings, hasTodayEntry)
-        .then(res => {
-          if (!res.success && res.error) {
-            showToast('Reminder Notice', res.error, 'error');
-          }
-        })
-        .catch(err => {
-          showToast('Reminder Sync Error', err?.message || 'Could not schedule native reminders', 'error');
-        });
+      if (!newSettings.enabled) {
+        cancelAllPendingNotifications().catch(e => console.warn('Cancel error:', e));
+      } else {
+        syncReminders(newSettings, hasTodayEntry)
+          .then(res => {
+            if (!res.success && res.error) {
+              showToast('Reminder Notice', res.error, 'error');
+            }
+          })
+          .catch(err => {
+            showToast('Reminder Sync Error', err?.message || 'Could not schedule native reminders', 'error');
+          });
+      }
     }, 50);
   };
 

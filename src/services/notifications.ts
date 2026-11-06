@@ -1,5 +1,7 @@
 import { Capacitor } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
+import { App as CapApp } from '@capacitor/app';
+import { NativeSettings, AndroidSettings } from 'capacitor-native-settings';
 import { ReminderSettings } from '../types';
 import { formatDateToIso } from './markdown';
 
@@ -216,6 +218,117 @@ export async function cancelTodayPendingNotification(): Promise<void> {
 }
 
 /**
+ * Cancels ALL pending native notifications using LocalNotifications.getPending() and LocalNotifications.cancel().
+ * Called when the daily reminder toggle is switched OFF.
+ */
+export async function cancelAllPendingNotifications(): Promise<{ success: boolean; canceledCount: number; error?: string }> {
+  if (!isNativePlatform()) return { success: true, canceledCount: 0 };
+  try {
+    const plugin = getNativeLocalNotifications();
+    if (!plugin) return { success: true, canceledCount: 0 };
+
+    const pending: any = await withPluginTimeout(
+      plugin.getPending(),
+      'LocalNotifications.getPending()'
+    );
+    const notifications = pending?.notifications || [];
+    if (notifications.length > 0) {
+      await withPluginTimeout(
+        plugin.cancel({ notifications }),
+        'LocalNotifications.cancel(all)'
+      );
+    }
+    return { success: true, canceledCount: notifications.length };
+  } catch (err: any) {
+    console.warn('Failed to cancel all notifications:', err);
+    return { success: false, canceledCount: 0, error: err?.message || 'Failed to cancel notifications' };
+  }
+}
+
+/**
+ * Opens the Android system notification settings for this application via capacitor-native-settings,
+ * falling back to the application details page.
+ */
+export async function openAndroidNotificationSettings(): Promise<{ success: boolean; error?: string }> {
+  if (!isNativePlatform()) {
+    return { success: false, error: 'Not running on a native platform' };
+  }
+
+  try {
+    const plugin: any = (typeof window !== 'undefined' && (window as any).Capacitor?.Plugins?.NativeSettings) || NativeSettings;
+    await withPluginTimeout(
+      plugin.openAndroid({
+        option: AndroidSettings.AppNotification,
+      }),
+      'NativeSettings.openAndroid(AppNotification)',
+      5000
+    );
+    return { success: true };
+  } catch (err1) {
+    console.warn('NativeSettings.openAndroid(AppNotification) failed, trying ApplicationDetails:', err1);
+    try {
+      const plugin: any = (typeof window !== 'undefined' && (window as any).Capacitor?.Plugins?.NativeSettings) || NativeSettings;
+      await withPluginTimeout(
+        plugin.openAndroid({
+          option: AndroidSettings.ApplicationDetails,
+        }),
+        'NativeSettings.openAndroid(ApplicationDetails)',
+        5000
+      );
+      return { success: true };
+    } catch (err2: any) {
+      console.warn('NativeSettings.openAndroid(ApplicationDetails) failed:', err2);
+      return { success: false, error: err2?.message || 'Could not open Android settings' };
+    }
+  }
+}
+
+/**
+ * Listens for appStateChange when returning to foreground (active).
+ * Automatically re-checks notification permissions and triggers callback.
+ */
+export function initForegroundResumeListener(
+  onForeground: (isGranted: boolean, rawStatus: string) => void
+): () => void {
+  if (!isNativePlatform()) return () => {};
+
+  try {
+    const appPlugin: any = (typeof window !== 'undefined' && (window as any).Capacitor?.Plugins?.App) || CapApp;
+    if (!appPlugin || typeof appPlugin.addListener !== 'function') return () => {};
+
+    const handle = appPlugin.addListener('appStateChange', async (state: any) => {
+      if (state?.isActive) {
+        try {
+          const plugin = getNativeLocalNotifications();
+          if (plugin) {
+            const perms: any = await withPluginTimeout(
+              plugin.checkPermissions(),
+              'LocalNotifications.checkPermissions(foreground)'
+            );
+            const rawDisplay = (perms?.display || 'prompt') as string;
+            const isGranted = rawDisplay === 'granted';
+            onForeground(isGranted, rawDisplay);
+          }
+        } catch (err) {
+          console.warn('Foreground permission check error:', err);
+        }
+      }
+    });
+
+    return () => {
+      if (handle && typeof handle.then === 'function') {
+        handle.then((h: any) => h?.remove?.()).catch(() => {});
+      } else if (handle && typeof (handle as any).remove === 'function') {
+        (handle as any).remove();
+      }
+    };
+  } catch (err) {
+    console.warn('Failed to register appStateChange listener:', err);
+    return () => {};
+  }
+}
+
+/**
  * Calls LocalNotifications.requestPermissions() directly in native mode,
  * then calls checkPermissions() again and returns raw results.
  */
@@ -317,6 +430,7 @@ export async function scheduleNative7DayReminders(
     }
 
     if (!settings.enabled) {
+      await cancelAllPendingNotifications();
       return { success: true, scheduledCount: 0 };
     }
 

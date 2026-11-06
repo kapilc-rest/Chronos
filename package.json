@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
     "@capacitor/cli": "^8.6.0",
     "@capacitor/core": "^8.6.0",
     "@capacitor/local-notifications": "^8.3.1",
@@ -21,6 +22,7 @@
     "@types/canvas-confetti": "^1.9.0",
     "@vitejs/plugin-react": "^6.1.1",
     "canvas-confetti": "^1.9.4",
+    "capacitor-native-settings": "^8.2.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",

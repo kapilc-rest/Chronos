@@ -13,13 +13,17 @@ import {
   AlertCircle,
   Smartphone,
   Globe,
-  FileText
+  FileText,
+  ExternalLink
 } from 'lucide-react';
 import { usePWAInstall } from '../usePWAInstall';
 import { ReminderSettings, StorageConfig, JournalEntry } from '../types';
 import { 
   getNativeDebugInfo,
   nativeDirectRequestPermission,
+  openAndroidNotificationSettings,
+  cancelAllPendingNotifications,
+  initForegroundResumeListener,
   requestExactAlarmSettings,
   scheduleNative7DayReminders,
   isNotificationSupported, 
@@ -63,6 +67,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [cfg, setCfg] = useState<StorageConfig>(config);
   const [notificationPermission, setNotificationPermission] = useState<string>('default');
   const [rawPermValue, setRawPermValue] = useState<string>('prompt');
+  const [hasAttemptedRequestWhileDenied, setHasAttemptedRequestWhileDenied] = useState<boolean>(false);
   const [lastError, setLastError] = useState<string | undefined>(undefined);
   const [copiedSchema, setCopiedSchema] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -99,6 +104,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setNativeDebug(debug);
       setNotificationPermission(debug.notificationPermission);
       setRawPermValue(debug.rawPermission);
+      if (debug.rawPermission === 'granted') {
+        setHasAttemptedRequestWhileDenied(false);
+      }
       if (debug.lastError) {
         setLastError(debug.lastError);
       }
@@ -117,11 +125,46 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, [isOpen, reminderSettings, config]);
 
+  // Foreground resume listener via @capacitor/app appStateChange
+  // When user returns from Android Settings, re-check permissions and update UI automatically,
+  // and schedule next 7 days if granted!
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const cleanup = initForegroundResumeListener(async (isGranted, rawStatus) => {
+      setNotificationPermission(rawStatus);
+      setRawPermValue(rawStatus);
+      if (isGranted) {
+        setHasAttemptedRequestWhileDenied(false);
+        if (reminders.enabled) {
+          scheduleNative7DayReminders(reminders, hasTodayEntry).catch(e => {
+            console.warn('Foreground schedule error:', e);
+          });
+        }
+      }
+      await refreshDebugInfo().catch(() => {});
+    });
+
+    return () => cleanup();
+  }, [isOpen, reminders.enabled, hasTodayEntry]);
+
   if (!isOpen) return null;
 
-  // Requirement 1: Make Request Permission call LocalNotifications.requestPermissions() directly
-  // in its click handler (no web Notification API in native mode), then call checkPermissions() again
-  // and show the raw result value in a toast.
+  // Open Android system notification settings via capacitor-native-settings
+  const handleOpenAndroidSettings = async () => {
+    try {
+      const res = await openAndroidNotificationSettings();
+      if (!res.success) {
+        onShowToast('Settings Navigation', 'Settings > Apps > Chronos > Notifications', 'info');
+      }
+    } catch {
+      onShowToast('Settings Navigation', 'Settings > Apps > Chronos > Notifications', 'info');
+    }
+  };
+
+  // Requirement 1: Native Permission Request handling
+  // If denied, call requestPermissions() once; if still denied without showing dialog,
+  // replace button with "Open Android Settings" and short message.
   const handleRequestPermission = async () => {
     try {
       if (isNativePlatform()) {
@@ -129,27 +172,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setNotificationPermission(res.rawDisplay);
         setRawPermValue(res.rawDisplay);
         setLastError(undefined);
-        onShowToast(
-          'Permission Result',
-          `Raw status: "${res.rawDisplay}"`,
-          res.granted ? 'success' : 'info'
-        );
 
-        if (res.granted && reminders.enabled) {
-          scheduleNative7DayReminders(reminders, hasTodayEntry)
-            .then(scheduleRes => {
-              if (scheduleRes.success) {
-                onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
-              } else if (scheduleRes.error) {
-                setLastError(scheduleRes.error);
-                onShowToast('Scheduling Failed', scheduleRes.error, 'error');
-              }
-            })
-            .catch(e => {
-              const msg = e?.message || String(e);
-              setLastError(msg);
-              onShowToast('Scheduling Error', msg, 'error');
-            });
+        if (res.granted) {
+          setHasAttemptedRequestWhileDenied(false);
+          onShowToast('Permission Granted', 'Notifications enabled for Chronos.', 'success');
+          if (reminders.enabled) {
+            scheduleNative7DayReminders(reminders, hasTodayEntry)
+              .then(scheduleRes => {
+                if (scheduleRes.success) {
+                  onShowToast('Reminders Scheduled', `Next ${scheduleRes.scheduledCount} days scheduled in Android alarm manager.`, 'success');
+                } else if (scheduleRes.error) {
+                  setLastError(scheduleRes.error);
+                  onShowToast('Scheduling Failed', scheduleRes.error, 'error');
+                }
+              })
+              .catch(e => {
+                const msg = e?.message || String(e);
+                setLastError(msg);
+                onShowToast('Scheduling Error', msg, 'error');
+              });
+          }
+        } else {
+          // Still denied without showing a system dialog
+          setHasAttemptedRequestWhileDenied(true);
+          onShowToast(
+            'Notifications Blocked',
+            'Notifications are blocked. Please enable them in Android Settings.',
+            'info'
+          );
         }
       } else {
         if (typeof window !== 'undefined' && 'Notification' in window) {
@@ -165,11 +215,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     } catch (err: any) {
       const errMsg = err?.message || String(err);
       setLastError(errMsg);
+      setHasAttemptedRequestWhileDenied(true);
       onShowToast('Permission Error', errMsg, 'error');
     }
   };
 
-  // Toggle Reminder handler with automatic native permission request
+  // Requirement 2: Toggle Reminders
+  // When turned OFF: cancel ALL pending native notifications with cancel / getPending, show toast "Reminders turned off"
+  // When turned ON: reschedule the next 7 days
   const handleToggleReminders = async (enabled: boolean) => {
     const updated = { ...reminders, enabled };
     setReminders(updated);
@@ -181,7 +234,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             const res = await nativeDirectRequestPermission();
             setNotificationPermission(res.rawDisplay);
             setRawPermValue(res.rawDisplay);
-            onShowToast('Permission Result', `Raw status: "${res.rawDisplay}"`, res.granted ? 'success' : 'info');
+            if (!res.granted) {
+              setHasAttemptedRequestWhileDenied(true);
+            }
           }
 
           scheduleNative7DayReminders(updated, hasTodayEntry)
@@ -207,16 +262,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           onShowToast('Permission Error', errMsg, 'error');
         }
       } else {
-        scheduleNative7DayReminders(updated, hasTodayEntry)
+        // Toggle OFF: cancel ALL pending native notifications and show toast "Reminders turned off"
+        cancelAllPendingNotifications()
+          .then(() => {
+            onShowToast('Reminders turned off', undefined, 'info');
+          })
           .catch(err => {
             const msg = err?.message || String(err);
             setLastError(msg);
-            onShowToast('Error', msg, 'error');
+            onShowToast('Cancel Error', msg, 'error');
           })
           .finally(() => {
             refreshDebugInfo().catch(() => {});
           });
-        onShowToast('Reminders Paused', 'Daily reminder notifications disabled.', 'info');
       }
     }
   };
@@ -234,7 +292,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-
   // Test Notification & Chime (Immediate web/chime test)
   const handleTestNotification = () => {
     if (reminders.sound) {
@@ -247,30 +304,31 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     onShowToast('Test Reminder Triggered', 'Harmonic chime played and notification triggered.', 'success');
   };
 
-  // Requirement 3: Never block Save Preferences on native calls:
-  // save the settings and close the modal first, then do native scheduling in the background with try/catch.
+  // Non-blocking Save Preferences
   const handleSave = () => {
-    // 1. Immediately save settings and close modal FIRST
     onSaveReminders(reminders);
     onSaveConfig(cfg);
     onShowToast('Settings Saved', 'All preferences have been updated.', 'success');
     onClose();
 
-    // 2. Perform native scheduling in background - NEVER blocks UI or modal close
     if (nativeDebug.isNative) {
       setTimeout(() => {
-        scheduleNative7DayReminders(reminders, hasTodayEntry)
-          .then(scheduleRes => {
-            if (!scheduleRes.success && scheduleRes.error) {
-              setLastError(scheduleRes.error);
-              onShowToast('Reminder Notice', scheduleRes.error, 'error');
-            }
-          })
-          .catch(err => {
-            const msg = err?.message || String(err);
-            setLastError(msg);
-            onShowToast('Native Scheduling Error', msg, 'error');
-          });
+        if (!reminders.enabled) {
+          cancelAllPendingNotifications().catch(e => console.warn('Cancel error:', e));
+        } else {
+          scheduleNative7DayReminders(reminders, hasTodayEntry)
+            .then(scheduleRes => {
+              if (!scheduleRes.success && scheduleRes.error) {
+                setLastError(scheduleRes.error);
+                onShowToast('Reminder Notice', scheduleRes.error, 'error');
+              }
+            })
+            .catch(err => {
+              const msg = err?.message || String(err);
+              setLastError(msg);
+              onShowToast('Native Scheduling Error', msg, 'error');
+            });
+        }
       }, 50);
     }
   };
@@ -394,7 +452,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return true;
   };
 
-  // Import JSON via file input (Android-compatible mime types)
+  // Import JSON via file input
   const handleImportFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -532,13 +590,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-700 dark:text-rose-400 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div className="flex items-start gap-2">
                     <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
-                    <span>Android notification permission is denied. Notifications will not appear until enabled.</span>
+                    <span>Notifications are blocked. Open Settings &gt; Notifications and turn them on for Chronos.</span>
                   </div>
                   <button
-                    onClick={handleRequestPermission}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shrink-0 transition-colors"
+                    onClick={handleOpenAndroidSettings}
+                    className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shrink-0 transition-colors cursor-pointer flex items-center gap-1.5"
                   >
-                    Request Permission
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Open Android Settings</span>
                   </button>
                 </div>
               )}
@@ -552,14 +611,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                   <button
                     onClick={handleRequestExactAlarms}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white shrink-0 transition-colors"
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white shrink-0 transition-colors cursor-pointer"
                   >
                     Open Alarm Settings
                   </button>
                 </div>
               )}
-
-
 
               {/* Main Toggle */}
               <div className="flex items-center justify-between p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40">
@@ -615,7 +672,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Permission Status Box with direct Request Permission button */}
+              {/* Permission Status Box with Requirement 1 logic */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -633,13 +690,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </span>
                   </div>
 
-                  <button
-                    onClick={handleRequestPermission}
-                    className="px-3 py-1 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer shadow-xs"
-                  >
-                    Request Permission
-                  </button>
+                  {/* Native Android Permission Action Buttons */}
+                  {nativeDebug.isNative ? (
+                    rawPermValue === 'granted' ? (
+                      /* When granted: show Manage in Android Settings button instead of Request Permission */
+                      <button
+                        onClick={handleOpenAndroidSettings}
+                        className="px-3.5 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
+                        <span>Manage in Android Settings</span>
+                      </button>
+                    ) : (rawPermValue === 'denied' && hasAttemptedRequestWhileDenied) ? (
+                      /* When denied and requested once: replace Request Permission button with Open Android Settings */
+                      <button
+                        onClick={handleOpenAndroidSettings}
+                        className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>Open Android Settings</span>
+                      </button>
+                    ) : (
+                      /* Initial / prompt state: Request Permission */
+                      <button
+                        onClick={handleRequestPermission}
+                        className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer shadow-xs"
+                      >
+                        Request Permission
+                      </button>
+                    )
+                  ) : (
+                    /* Web mode: Request Permission if not granted */
+                    rawPermValue !== 'granted' && (
+                      <button
+                        onClick={handleRequestPermission}
+                        className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer shadow-xs"
+                      >
+                        Request Permission
+                      </button>
+                    )
+                  )}
                 </div>
+
+                {/* Sub-messages for permission statuses */}
+                {nativeDebug.isNative && rawPermValue === 'granted' && (
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Notifications are active. Permission can only be turned off in Android system settings.
+                  </p>
+                )}
+
+                {nativeDebug.isNative && rawPermValue === 'denied' && hasAttemptedRequestWhileDenied && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 font-medium">
+                    Notifications are blocked. Open Settings &gt; Notifications and turn them on for Chronos.
+                  </p>
+                )}
 
                 <div className="pt-2 flex items-center justify-between border-t border-slate-200/60 dark:border-slate-800/60">
                   <span className="text-xs text-slate-500 dark:text-slate-400">
