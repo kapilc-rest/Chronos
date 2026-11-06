@@ -13,8 +13,6 @@ import {
   AlertCircle,
   Smartphone,
   Globe,
-  RefreshCw,
-  Clock,
   FileText
 } from 'lucide-react';
 import { usePWAInstall } from '../usePWAInstall';
@@ -24,7 +22,6 @@ import {
   nativeDirectRequestPermission,
   requestExactAlarmSettings,
   scheduleNative7DayReminders,
-  scheduleTestNotificationIn1Minute,
   isNotificationSupported, 
   playHarmonicChime,
   triggerBrowserNotification,
@@ -69,7 +66,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [lastError, setLastError] = useState<string | undefined>(undefined);
   const [copiedSchema, setCopiedSchema] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
-  const [isSchedulingTest, setIsSchedulingTest] = useState(false);
   const [pastedJson, setPastedJson] = useState('');
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
 
@@ -238,31 +234,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  // Requirement 4: Use try/finally so the "Scheduling..." button always resets
-  const handleScheduleTest1Minute = async () => {
-    setIsSchedulingTest(true);
-    try {
-      const res = await scheduleTestNotificationIn1Minute();
-      if (res.success) {
-        onShowToast(
-          'Test Reminder Scheduled',
-          `Alert scheduled for ${res.scheduledTime || 'in 1 minute'}. You may lock or background your phone.`,
-          'success'
-        );
-      } else {
-        const errText = res.error || 'Could not schedule 1-minute test.';
-        setLastError(errText);
-        onShowToast('Test Schedule Failed', errText, 'error');
-      }
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
-      setLastError(errMsg);
-      onShowToast('Test Schedule Error', errMsg, 'error');
-    } finally {
-      setIsSchedulingTest(false);
-      await refreshDebugInfo().catch(() => {});
-    }
-  };
 
   // Test Notification & Chime (Immediate web/chime test)
   const handleTestNotification = () => {
@@ -588,121 +559,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               )}
 
-              {/* Requirement 5: Native Android Diagnostics Card with raw permission value & last error */}
-              {nativeDebug.isNative && (
-                <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Smartphone className="w-4 h-4 text-emerald-500" />
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
-                        Native Android Diagnostics
-                      </h4>
-                    </div>
-                    <button
-                      onClick={refreshDebugInfo}
-                      className="text-[11px] px-2 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 flex items-center gap-1 transition-colors cursor-pointer"
-                      title="Refresh status from LocalNotifications"
-                    >
-                      <RefreshCw className="w-3 h-3" />
-                      <span>Refresh</span>
-                    </button>
-                  </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                    {/* Raw Notification Permission Value */}
-                    <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                      <span className="block text-[10px] text-slate-400 font-medium">Raw Plugin Perm</span>
-                      <span className={`inline-block mt-1 px-1.5 py-0.5 rounded text-[11px] font-mono font-bold ${
-                        rawPermValue === 'granted'
-                          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
-                          : rawPermValue === 'denied'
-                          ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20'
-                          : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
-                      }`}>
-                        {rawPermValue}
-                      </span>
-                    </div>
-
-                    {/* Exact Alarm Setting */}
-                    <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                      <span className="block text-[10px] text-slate-400 font-medium">Exact Alarm Setting</span>
-                      <div className="flex items-center gap-1 mt-1">
-                        <span className={`px-1.5 py-0.5 rounded text-[11px] font-mono font-semibold ${
-                          nativeDebug.exactAlarmPermission === 'granted'
-                            ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
-                        }`}>
-                          {nativeDebug.exactAlarmPermission}
-                        </span>
-                        {nativeDebug.exactAlarmPermission === 'denied' && (
-                          <button
-                            onClick={handleRequestExactAlarms}
-                            className="text-[10px] text-amber-600 dark:text-amber-400 underline font-semibold"
-                          >
-                            Settings
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Pending Notifications Count */}
-                    <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                      <span className="block text-[10px] text-slate-400 font-medium">Pending Alerts</span>
-                      <span className="block mt-1 text-[12px] font-mono font-bold text-slate-800 dark:text-slate-200">
-                        {nativeDebug.pendingCount} scheduled
-                      </span>
-                    </div>
-
-                    {/* Next Scheduled Reminder Time */}
-                    <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                      <span className="block text-[10px] text-slate-400 font-medium">Next Scheduled</span>
-                      <span className="block mt-1 text-[11px] font-medium text-slate-700 dark:text-slate-300 truncate" title={nativeDebug.nextScheduledTime || 'None pending'}>
-                        {nativeDebug.nextScheduledTime || 'None pending'}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Last Error Banner */}
-                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800/60">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-slate-400 font-medium uppercase tracking-wider">Last Plugin Error</span>
-                      {lastError && (
-                        <button
-                          onClick={() => setLastError(undefined)}
-                          className="text-[10px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 underline"
-                        >
-                          Clear
-                        </button>
-                      )}
-                    </div>
-                    {lastError ? (
-                      <div className="mt-1 flex items-start gap-1.5 text-rose-600 dark:text-rose-400">
-                        <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                        <span className="text-[11px] font-mono break-all leading-tight">{lastError}</span>
-                      </div>
-                    ) : (
-                      <span className="block mt-1 text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
-                        None (all plugin calls healthy)
-                      </span>
-                    )}
-                  </div>
-
-                  {/* 1-Minute Test Scheduling Button with try/finally guarantee */}
-                  <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/60 dark:border-slate-800/60">
-                    <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                      Test background wake-up while app is minimized or device is locked:
-                    </span>
-                    <button
-                      onClick={handleScheduleTest1Minute}
-                      disabled={isSchedulingTest}
-                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
-                    >
-                      <Clock className="w-3.5 h-3.5" />
-                      <span>{isSchedulingTest ? 'Scheduling...' : 'Schedule test in 1 minute'}</span>
-                    </button>
-                  </div>
-                </div>
-              )}
 
               {/* Main Toggle */}
               <div className="flex items-center justify-between p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40">
