@@ -22,6 +22,15 @@ jobs:
         run: |
           sed -i 's#</manifest>#<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/><uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/></manifest>#' android/app/src/main/AndroidManifest.xml
       - run: npx cap sync android
+      - name: Use permanent signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p ~/.android
+          echo "$KS_B64" | base64 -d > ~/.android/debug.keystore
+          keytool -changealias -keystore ~/.android/debug.keystore -alias chronos -destalias androiddebugkey -storepass "$KS_PASS"
+          keytool -storepasswd -keystore ~/.android/debug.keystore -storepass "$KS_PASS" -new android
       - run: cd android && ./gradlew assembleDebug
       - uses: actions/upload-artifact@v4
         with:
